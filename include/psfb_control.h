@@ -16,7 +16,7 @@
 #endif
 
 #ifndef FSW_HZ
-#define FSW_HZ 18000u
+#define FSW_HZ 100000u
 #endif
 
 #ifndef CLOCK_SOURCE

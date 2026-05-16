@@ -2,7 +2,7 @@
 #define BOARD_PINS_H
 
 /*
- * STM32F103C8T6 / STM32F103CBT6 full-bridge gate-drive pin map.
+ * STM32F103C6T6 full-bridge gate-drive pin map.
  *
  * Every isolated gate-driver input must have an external pull-down resistor.
  * Firmware reset/default GPIO state must never be the only OFF guarantee.

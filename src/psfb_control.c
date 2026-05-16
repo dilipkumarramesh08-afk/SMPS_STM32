@@ -2,390 +2,270 @@
 
 #include "stm32f1xx.h"
 
-volatile uint16_t g_phase_ticks = 0;
-volatile psfb_state_t g_psfb_state = STATE_IDLE;
-volatile psfb_fault_t g_psfb_fault = FAULT_NONE;
+volatile psfb_status_t g_psfb = {0};
 
-psfb_config_t g_psfb_config = {
-    CONTROL_MODE,
-    0u,
-    TARGET_VOUT_DEFAULT,
-    5.0f,
-    MANUAL_EST_OUTPUT_VOLTAGE,
-    MANUAL_EST_INPUT_VOLTAGE
-};
+static volatile uint16_t s_pending_phase_ticks = 0;
+static int32_t s_integrator = 0;
+static uint16_t s_feedback_low_ms = 0;
+static uint8_t s_outputs_enabled = 0;
 
-psfb_runtime_status_t g_psfb_status = {0.0f, 0.0f, 0.0f};
-
-static float s_integrator = 0.0f;
-static float s_open_loop_softstart_percent = 0.0f;
-static float s_target_softstart_vout = 0.0f;
-static uint8_t s_outputs_enabled = 0u;
-static uint16_t s_low_feedback_count = 0u;
-static uint16_t s_feedback_run_count = 0u;
-
-static void apply_command_percent(float command_percent);
-
-static float clampf(float x, float lo, float hi)
+static inline void psfb_emergency_shutdown(void)
 {
-    if (x < lo) {
-        return lo;
+    TIM1->BDTR &= ~TIM_BDTR_MOE;
+    s_pending_phase_ticks = 0;
+    g_psfb.phase_actual_permille = 0;
+    g_psfb.phase_cmd_permille = 0;
+    TIM1->CCR2 = 1U;
+    s_outputs_enabled = 0;
+}
+
+uint8_t psfb_deadtime_dtg(void)
+{
+    uint32_t ticks = ((DEADTIME_NS * (TIM1_CLK_HZ / 1000000UL)) + 999UL) / 1000UL;
+
+    // cppcheck-suppress knownConditionTrueFalse
+    if (ticks > 127UL) {
+        ticks = 127UL;
     }
-    if (x > hi) {
-        return hi;
-    }
-    return x;
-}
-
-static float open_loop_max_percent(void)
-{
-#if TEST_UNLOCK_HIGH_DUTY
-    return DUTY_MAX_ABSOLUTE_PERCENT;
-#else
-    return DUTY_MAX_INITIAL_PERCENT;
-#endif
-}
-
-static float feedback_max_percent(void)
-{
-    return DUTY_MAX_ABSOLUTE_PERCENT;
-}
-
-static void reset_control_state(void)
-{
-    s_integrator = 0.0f;
-    s_open_loop_softstart_percent = 0.0f;
-    s_target_softstart_vout = 0.0f;
-    s_low_feedback_count = 0u;
-    s_feedback_run_count = 0u;
-    g_psfb_status.command_percent = 0.0f;
-    g_psfb_status.applied_percent = 0.0f;
-    g_psfb_status.ramped_target_vout = 0.0f;
-}
-
-uint8_t psfb_deadtime_ns_to_dtg(uint32_t deadtime_ns)
-{
-    uint32_t ticks = ((deadtime_ns * (SYSCLK_HZ / 1000000u)) + 999u) / 1000u;
-
-    if (ticks > 127u) {
-        ticks = 127u;
-    }
-
     return (uint8_t)ticks;
 }
 
-uint16_t psfb_percent_to_phase_ticks(float phase_percent)
+static uint16_t phase_permille_to_ticks(uint16_t permille)
 {
-    float ticks;
-    uint16_t max_ticks;
+    uint32_t ticks;
 
-    phase_percent = clampf(phase_percent, 0.0f, DUTY_MAX_ABSOLUTE_PERCENT);
-    ticks = (phase_percent * 0.01f) * (float)TIM1_PERIOD_TICKS;
-    max_ticks = (uint16_t)(((DUTY_MAX_ABSOLUTE_PERCENT * 0.01f) *
-                            (float)TIM1_PERIOD_TICKS) + 0.5f);
-
-    if (ticks < 0.0f) {
-        return 0u;
-    }
-    if (ticks > (float)max_ticks) {
-        return max_ticks;
+    if (permille > PHASE_SHIFT_MAX_ABSOLUTE_PERMILLE) {
+        permille = PHASE_SHIFT_MAX_ABSOLUTE_PERMILLE;
     }
 
-    return (uint16_t)(ticks + 0.5f);
-}
-void psfb_set_phase_ticks(uint16_t ticks)
-{
-    uint16_t max_ticks = psfb_percent_to_phase_ticks(DUTY_MAX_ABSOLUTE_PERCENT);
-    uint16_t base_compare = 1u;
-    uint16_t ccr2;
-
-    if (ticks > max_ticks) {
-        ticks = max_ticks;
+    ticks = ((uint32_t)permille * TIM1_ARR_VALUE) / 1000UL;
+    if (ticks > TIM1_ARR_VALUE) {
+        ticks = TIM1_ARR_VALUE;
     }
-
-    ccr2 = (uint16_t)(base_compare + ticks);
-    if (ccr2 > TIM1_ARR_VALUE) {
-        ccr2 = TIM1_ARR_VALUE;
-    }
-
-    g_phase_ticks = ticks;
-    TIM1->CCR1 = base_compare;
-    TIM1->CCR2 = ccr2;
+    return (uint16_t)ticks;
 }
 
-static void apply_command_percent(float command_percent)
+static void schedule_phase_update(uint16_t phase_ticks)
 {
-    command_percent = clampf(command_percent, 0.0f, DUTY_MAX_ABSOLUTE_PERCENT);
-
-    psfb_set_phase_ticks(psfb_percent_to_phase_ticks(command_percent));
-
-    g_psfb_status.applied_percent = command_percent;
-}
-
-static float estimate_open_loop_voltage_percent(void)
-{
-    float secondary_per_primary;
-    float denominator;
-    float duty;
-
-    if ((g_psfb_config.manual_est_input_voltage <= 0.0f) ||
-        (PRIMARY_TURNS <= 0.0f) ||
-        (SECONDARY_TURNS_TOTAL <= 0.0f) ||
-        (g_psfb_config.manual_est_output_voltage < 0.0f)) {
-        psfb_disable_outputs(FAULT_INVALID_COMMAND);
-        return 0.0f;
+    if (phase_ticks > phase_permille_to_ticks(PHASE_SHIFT_MAX_ABSOLUTE_PERMILLE)) {
+        phase_ticks = phase_permille_to_ticks(PHASE_SHIFT_MAX_ABSOLUTE_PERMILLE);
     }
-
-    secondary_per_primary = SECONDARY_TURNS_TOTAL / PRIMARY_TURNS;
-    denominator = g_psfb_config.manual_est_input_voltage * secondary_per_primary;
-    duty = (g_psfb_config.manual_est_output_voltage + RECTIFIER_DIODE_DROP_TOTAL) / denominator;
-
-    return duty * 100.0f;
-}
-
-float psfb_get_command_percent(void)
-{
-    float command = 0.0f;
-
-    if (g_psfb_config.control_mode == CONTROL_MODE_OPEN_LOOP_DUTY) {
-        command = g_psfb_config.manual_command_percent;
-    } else if (g_psfb_config.control_mode == CONTROL_MODE_OPEN_LOOP_EST_VOLT) {
-        command = estimate_open_loop_voltage_percent();
-    } else {
-        command = feedback_max_percent();
-    }
-
-    if (command < 0.0f) {
-        psfb_disable_outputs(FAULT_INVALID_COMMAND);
-        return 0.0f;
-    }
-
-    command = clampf(command, 0.0f, open_loop_max_percent());
-    g_psfb_status.command_percent = command;
-    return command;
-}
-
-void psfb_disable_outputs(psfb_fault_t fault)
-{
-    TIM1->BDTR &= ~TIM_BDTR_MOE;
-    apply_command_percent(0.0f);
-    g_psfb_fault = fault;
-    g_psfb_state = STATE_FAULT;
-    s_outputs_enabled = 0u;
+    s_pending_phase_ticks = phase_ticks;
 }
 
 // cppcheck-suppress unusedFunction
-void psfb_clear_fault(void)
+void TIM1_UP_IRQHandler(void)
 {
-    TIM1->SR &= ~(TIM_SR_BIF | TIM_SR_UIF);
-    g_psfb_fault = FAULT_NONE;
-    g_psfb_state = STATE_IDLE;
-    s_outputs_enabled = 0u;
-    reset_control_state();
-    apply_command_percent(0.0f);
+    if ((TIM1->SR & TIM_SR_UIF) != 0U) {
+        TIM1->SR = (uint16_t)~TIM_SR_UIF;
+        TIM1->CCR2 = (uint16_t)(1U + s_pending_phase_ticks);
+    }
+}
+
+void psfb_latch_fault(fault_t fault)
+{
+    if (g_psfb.fault == FAULT_NONE) {
+        g_psfb.fault = fault;
+    }
+    psfb_emergency_shutdown();
 }
 
 // cppcheck-suppress unusedFunction
-void psfb_init(void)
+void psfb_init_timer(void)
 {
-    uint16_t ccer = 0u;
-    uint32_t ccmr1 = 0u;
+    uint32_t ccmr1;
     uint32_t bdtr;
 
     RCC->APB2ENR |= RCC_APB2ENR_TIM1EN;
 
-    TIM1->BDTR = 0u;
-    TIM1->CR1 = 0u;
-    TIM1->CR2 = 0u;
-    TIM1->CCER = 0u;
-    TIM1->PSC = 0u;
-    TIM1->ARR = TIM1_ARR_VALUE;             /* 72 MHz / (2 * 100 kHz) - 1 = 359 */
-    TIM1->RCR = 0u;
+    TIM1->BDTR = 0U;                 /* MOE off during all setup. */
+    TIM1->CR1 = 0U;
+    TIM1->CR2 = 0U;
+    TIM1->CCER = 0U;
+    TIM1->PSC = 0U;
+    TIM1->ARR = (uint16_t)TIM1_ARR_VALUE;
+    TIM1->RCR = 0U;
 
+    /*
+     * True PSFB timing:
+     * CH1/CH1N are the fixed 50% left leg.
+     * CH2/CH2N are the fixed 50% right leg.
+     * OC toggle mode toggles once per timer update; one bridge-leg cycle has
+     * one ON half-cycle and one OFF half-cycle. Phase is controlled only by CCR2.
+     */
     TIM1->CR1 = TIM_CR1_ARPE;
-    ccmr1 |= (3u << TIM_CCMR1_OC1M_Pos) | TIM_CCMR1_OC1PE;
-    ccmr1 |= (3u << TIM_CCMR1_OC2M_Pos) | TIM_CCMR1_OC2PE;
+    ccmr1 = (3U << TIM_CCMR1_OC1M_Pos) | TIM_CCMR1_OC1PE |
+            (3U << TIM_CCMR1_OC2M_Pos) | TIM_CCMR1_OC2PE;
     TIM1->CCMR1 = ccmr1;
-    psfb_set_phase_ticks(0u);
+    TIM1->CCR1 = 1U;
+    TIM1->CCR2 = 1U;
 
-    ccer |= TIM_CCER_CC1E | TIM_CCER_CC1NE | TIM_CCER_CC2E | TIM_CCER_CC2NE;
-#if INVERT_TIM1_OUTPUT_POLARITY
-    ccer |= TIM_CCER_CC1P | TIM_CCER_CC2P;
-#endif
-#if INVERT_TIM1_N_OUTPUT_POLARITY
-    ccer |= TIM_CCER_CC1NP | TIM_CCER_CC2NP;
-#endif
-    TIM1->CCER = ccer;
+    TIM1->CCER = TIM_CCER_CC1E | TIM_CCER_CC1NE | TIM_CCER_CC2E | TIM_CCER_CC2NE;
 
-    bdtr = TIM_BDTR_OSSI | TIM_BDTR_OSSR | psfb_deadtime_ns_to_dtg(DEADTIME_NS);
-#if ENABLE_TIM1_BKIN
-    bdtr |= TIM_BDTR_BKE;
-#endif
-    TIM1->BDTR = bdtr;                      /* MOE intentionally remains 0. */
+    bdtr = TIM_BDTR_OSSI | TIM_BDTR_OSSR | psfb_deadtime_dtg();
+    /* PB12/TIM1_BKIN is reserved for future current-trip hardware. */
+    TIM1->BDTR = bdtr;
+
+    TIM1->DIER |= TIM_DIER_UIE;
+    NVIC_EnableIRQ(TIM1_UP_IRQn);
 
     TIM1->EGR = TIM_EGR_UG;
-    TIM1->SR = 0u;
-    TIM1->CR1 |= TIM_CR1_CEN;
+    TIM1->SR = 0U;
+    TIM1->CR1 |= TIM_CR1_CEN;        /* Counter runs with outputs disabled. */
 }
 
 // cppcheck-suppress unusedFunction
-void psfb_start(void)
+void psfb_start_outputs(void)
 {
-    if (g_psfb_fault != FAULT_NONE) {
-        return;
-    }
-
-    if ((g_psfb_config.control_mode == CONTROL_MODE_CLOSED_LOOP_FEEDBACK) &&
-        g_psfb_config.feedback_enabled) {
-        g_psfb_state = STATE_SOFTSTART;
-    } else {
-        g_psfb_state = STATE_OPEN_LOOP_RAMP;
-    }
-}
-
-static void enable_outputs_once_ready(void)
-{
-    if (!s_outputs_enabled) {
+    if (g_psfb.fault == FAULT_NONE) {
         TIM1->BDTR |= TIM_BDTR_MOE;
-        s_outputs_enabled = 1u;
+        s_outputs_enabled = 1;
     }
 }
 
-static void run_open_loop(const psfb_adc_sample_t *adc)
+static uint32_t adc_to_vout_mv(uint16_t adc_raw)
 {
-    float target;
-
-    (void)adc;
-
-    target = psfb_get_command_percent();
-    if (SOFTSTART_TIME_MS == 0u) {
-        s_open_loop_softstart_percent = target;
-    } else {
-        float step_per_ms = (target * (float)CONTROL_LOOP_PERIOD_MS) /
-                            (float)SOFTSTART_TIME_MS;
-        s_open_loop_softstart_percent += step_per_ms;
-        if (s_open_loop_softstart_percent > target) {
-            s_open_loop_softstart_percent = target;
-        }
-    }
-
-    apply_command_percent(s_open_loop_softstart_percent);
-    enable_outputs_once_ready();
-
-    if (s_open_loop_softstart_percent >= target) {
-        g_psfb_state = STATE_RUN;
-    }
+    uint32_t adc_mv = ((uint32_t)adc_raw * ADC_REF_MV) / ADC_FULL_SCALE;
+    return (adc_mv * VOUT_FEEDBACK_SCALE_NUM) / VOUT_FEEDBACK_SCALE_DEN;
 }
 
-static void run_closed_loop(const psfb_adc_sample_t *adc)
+static uint16_t pi_controller(int32_t error_mv, uint16_t max_permille)
 {
-    const float kp = FEEDBACK_KP;
-    const float ki = FEEDBACK_KI;
-    float max_percent = feedback_max_percent();
-    float ovp = g_psfb_config.target_vout * OVP_MULTIPLIER;
-    float target_step;
-    float error;
-    float candidate_integrator;
-    float command;
+    enum {
+        KP_NUM = 1,
+        KP_DEN_SHIFT = 9,
+        KI_NUM = 1,
+        KI_DEN_SHIFT = 12,
+        INTEGRATOR_MIN = -120000,
+        INTEGRATOR_MAX = 120000
+    };
+    int32_t p;
+    int32_t candidate_integrator;
+    int32_t out;
+    uint16_t saturated;
 
-    if (adc == 0) {
-        psfb_disable_outputs(FAULT_FEEDBACK_LOW_OR_DISCONNECTED);
-        return;
+    p = (error_mv * KP_NUM) >> KP_DEN_SHIFT;
+    candidate_integrator = s_integrator + ((error_mv * KI_NUM) >> KI_DEN_SHIFT);
+
+    if (candidate_integrator > INTEGRATOR_MAX) {
+        candidate_integrator = INTEGRATOR_MAX;
+    } else if (candidate_integrator < INTEGRATOR_MIN) {
+        candidate_integrator = INTEGRATOR_MIN;
     }
 
-    if (adc->raw > ADC_NEAR_FULL_SCALE_LIMIT) {
-        psfb_disable_outputs(FAULT_ADC_NEAR_FULL_SCALE);
-        return;
-    }
-
-    if (adc->vout > ovp) {
-        psfb_disable_outputs(FAULT_OVERVOLTAGE);
-        return;
-    }
-
-    if (s_feedback_run_count < 0xffffu) {
-        s_feedback_run_count++;
-    }
-
-    target_step = (g_psfb_config.target_vout * (float)CONTROL_LOOP_PERIOD_MS) /
-                  (float)SOFTSTART_TIME_MS;
-    s_target_softstart_vout += target_step;
-    if (s_target_softstart_vout > g_psfb_config.target_vout) {
-        s_target_softstart_vout = g_psfb_config.target_vout;
-    }
-    g_psfb_status.ramped_target_vout = s_target_softstart_vout;
-
-    if ((s_target_softstart_vout > TARGET_VOUT_MIN) &&
-        (adc->vout < (s_target_softstart_vout * VOUT_COLLAPSE_RATIO))) {
-        s_integrator = 0.0f;
-        command = DUTY_SAFE_LIMIT_PERCENT;
-        if (g_psfb_status.applied_percent > command) {
-            apply_command_percent(command);
-        }
-        g_psfb_status.command_percent = command;
-        enable_outputs_once_ready();
-        return;
-    }
-
-    if ((g_psfb_status.applied_percent > 5.0f) &&
-        (s_target_softstart_vout > 5.0f) &&
-        (adc->raw < 20u) &&
-        ((uint32_t)s_feedback_run_count >
-         (FEEDBACK_LOW_BLANKING_MS / CONTROL_LOOP_PERIOD_MS))) {
-        if (++s_low_feedback_count > 500u) {
-            psfb_disable_outputs(FAULT_FEEDBACK_LOW_OR_DISCONNECTED);
-            return;
-        }
+    out = p + candidate_integrator;
+    if (out < 0) {
+        saturated = 0;
+    } else if (out > max_permille) {
+        saturated = max_permille;
     } else {
-        s_low_feedback_count = 0u;
+        saturated = (uint16_t)out;
     }
 
-    error = s_target_softstart_vout - adc->vout;
-    candidate_integrator = s_integrator + (ki * error);
-    command = (kp * error) + candidate_integrator;
-    command = clampf(command, 0.0f, max_percent);
-
-    if (((command > 0.0f) && (command < max_percent)) ||
-        ((command <= 0.0f) && (error > 0.0f)) ||
-        ((command >= max_percent) && (error < 0.0f))) {
+    if (((saturated > 0U) && (saturated < max_permille)) ||
+        ((saturated == 0U) && (error_mv > 0)) ||
+        ((saturated == max_permille) && (error_mv < 0))) {
         s_integrator = candidate_integrator;
     }
 
-    if (command > (g_psfb_status.applied_percent + DUTY_SLEW_UP_PERCENT_PER_MS)) {
-        command = g_psfb_status.applied_percent +
-                  (DUTY_SLEW_UP_PERCENT_PER_MS * (float)CONTROL_LOOP_PERIOD_MS);
-    }
-
-    g_psfb_status.command_percent = command;
-    apply_command_percent(command);
-    enable_outputs_once_ready();
-
-    if (s_target_softstart_vout >= g_psfb_config.target_vout) {
-        g_psfb_state = STATE_RUN;
-    }
+    return saturated;
 }
 
 // cppcheck-suppress unusedFunction
-void psfb_control_1khz(const psfb_adc_sample_t *adc)
+void psfb_control_1khz(uint32_t target_vout_mv, uint16_t adc_raw)
 {
-    if (g_psfb_state == STATE_FAULT) {
-        TIM1->BDTR &= ~TIM_BDTR_MOE;
+    uint32_t ovp_limit_mv;
+    uint32_t collapse_limit_mv;
+    uint16_t max_permille = PHASE_SHIFT_MAX_ALLOWED_PERMILLE;
+    uint16_t phase_cmd;
+
+    if (g_psfb.fault != FAULT_NONE) {
+        psfb_emergency_shutdown();
         return;
     }
 
-#if ENABLE_TIM1_BKIN
-    if (TIM1->SR & TIM_SR_BIF) {
-        psfb_disable_outputs(FAULT_EXTERNAL_BREAK);
+    if ((TIM1->SR & TIM_SR_BIF) != 0U) {
+        psfb_latch_fault(FAULT_EXTERNAL_BREAK);
         return;
     }
-#endif
 
-    if ((g_psfb_config.control_mode == CONTROL_MODE_CLOSED_LOOP_FEEDBACK) &&
-        g_psfb_config.feedback_enabled) {
-        run_closed_loop(adc);
+    if ((target_vout_mv < TARGET_VOUT_MIN_MV) || (target_vout_mv > TARGET_VOUT_MAX_MV)) {
+        psfb_latch_fault(FAULT_INVALID_TARGET);
+        return;
+    }
+
+    g_psfb.adc_raw = adc_raw;
+    if (g_psfb.adc_filtered == 0U) {
+        g_psfb.adc_filtered = adc_raw;
     } else {
-        run_open_loop(adc);
+        int32_t delta = (int32_t)adc_raw - (int32_t)g_psfb.adc_filtered;
+        g_psfb.adc_filtered = (uint16_t)((int32_t)g_psfb.adc_filtered +
+                                         (delta >> ADC_FILTER_SHIFT));
     }
-}
 
-// cppcheck-suppress unusedFunction
+    g_psfb.vout_mv = adc_to_vout_mv(g_psfb.adc_filtered);
+
+    if (g_psfb.adc_filtered > ADC_NEAR_FULL_SCALE_LIMIT) {
+        psfb_latch_fault(FAULT_ADC_NEAR_FULL_SCALE);
+        return;
+    }
+
+    ovp_limit_mv = (target_vout_mv * OVP_MULTIPLIER_NUM) / OVP_MULTIPLIER_DEN;
+    if (g_psfb.vout_mv > ovp_limit_mv) {
+        psfb_latch_fault(FAULT_OVERVOLTAGE);
+        return;
+    }
+
+    if (g_psfb.target_ramped_mv < target_vout_mv) {
+        uint32_t step = target_vout_mv / SOFTSTART_TIME_MS;
+        if (step == 0UL) {
+            step = 1UL;
+        }
+        g_psfb.target_ramped_mv += step;
+        if (g_psfb.target_ramped_mv > target_vout_mv) {
+            g_psfb.target_ramped_mv = target_vout_mv;
+        }
+    }
+
+    collapse_limit_mv = (g_psfb.target_ramped_mv * VOUT_COLLAPSE_RATIO_NUM) /
+                        VOUT_COLLAPSE_RATIO_DEN;
+
+    if ((g_psfb.target_ramped_mv > 4000UL) && (g_psfb.vout_mv < collapse_limit_mv)) {
+        s_integrator = 0;
+        phase_cmd = SAFE_LOW_PHASE_PERMILLE;
+        if (phase_cmd > max_permille) {
+            phase_cmd = max_permille;
+        }
+    } else {
+        int32_t error_mv;
+        error_mv = (int32_t)g_psfb.target_ramped_mv - (int32_t)g_psfb.vout_mv;
+        phase_cmd = pi_controller(error_mv, max_permille);
+    }
+
+    if ((s_outputs_enabled != 0U) &&
+        (g_psfb.target_ramped_mv > 5000UL) &&
+        (g_psfb.phase_actual_permille > 50U) &&
+        (g_psfb.adc_filtered < 20U)) {
+        if (++s_feedback_low_ms > FEEDBACK_LOW_TIMEOUT_MS) {
+            psfb_latch_fault(FAULT_FEEDBACK_LOW_OR_DISCONNECTED);
+            return;
+        }
+    } else {
+        s_feedback_low_ms = 0U;
+    }
+
+    if (phase_cmd > max_permille) {
+        phase_cmd = max_permille;
+    }
+    g_psfb.phase_cmd_permille = phase_cmd;
+
+    if (phase_cmd > g_psfb.phase_actual_permille) {
+        uint32_t next = (uint32_t)g_psfb.phase_actual_permille +
+                        PHASE_SHIFT_SLEW_UP_PERMILLE_PER_MS;
+        g_psfb.phase_actual_permille = (next > phase_cmd) ? phase_cmd : (uint16_t)next;
+    } else {
+        g_psfb.phase_actual_permille = phase_cmd;
+    }
+
+    schedule_phase_update(phase_permille_to_ticks(g_psfb.phase_actual_permille));
+}

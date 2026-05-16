@@ -1,26 +1,16 @@
+/*
+ * Change only this value to set output voltage.
+ * Allowed range: 24000U to 28000U.
+ */
+#define TARGET_VOUT_MV 24000U
+
 #include "psfb_control.h"
 #include "board_pins.h"
 
 #include "stm32f1xx.h"
 
-/*
- * User startup settings.
- *
- * Keep USER_ENABLE_FEEDBACK_CONTROL = 0 to preserve the current working
- * open-loop/manual mode. In that mode PA0 feedback is not used for regulation.
- *
- * Set USER_ENABLE_FEEDBACK_CONTROL = 1 only after the 100k/10k divider,
- * isolation/grounding, and ADC reading are verified.
- */
-#define USER_ENABLE_FEEDBACK_CONTROL      0u
-#define USER_TARGET_OUTPUT_VOLTAGE        24.0f
-#define USER_OPEN_LOOP_COMMAND_PERCENT    85.0f
-#define USER_EST_INPUT_VOLTAGE            90.0f
-#define USER_EST_OUTPUT_VOLTAGE           12.0f
-
 static volatile uint32_t g_ms_ticks = 0;
-static psfb_adc_sample_t g_adc_sample = {0u, 0.0f, 0.0f, 0.0f};
-static uint8_t g_adc_filter_initialized = 0u;
+static volatile uint16_t g_adc_dma[ADC_DMA_SAMPLES];
 
 // cppcheck-suppress unusedFunction
 void SysTick_Handler(void)
@@ -28,52 +18,21 @@ void SysTick_Handler(void)
     g_ms_ticks++;
 }
 
-static uint32_t millis(void)
+static void clock_init_72mhz_hse(void)
 {
-    return g_ms_ticks;
-}
-
-static void clock_init(void)
-{
-#if CLOCK_SOURCE == CLOCK_SOURCE_HSE_8MHZ_PLL_72MHZ
-    /* Enable HSE and wait until the 8 MHz crystal/oscillator is stable. */
     RCC->CR |= RCC_CR_HSEON;
-    while ((RCC->CR & RCC_CR_HSERDY) == 0u) {
+    while ((RCC->CR & RCC_CR_HSERDY) == 0U) {
     }
 
-    /* Flash wait states for 72 MHz and prefetch enabled. */
     FLASH->ACR = FLASH_ACR_PRFTBE | FLASH_ACR_LATENCY_2;
 
-    /*
-     * AHB = 72 MHz, APB2 = 72 MHz, APB1 = 36 MHz.
-     * ADC prescaler = PCLK2 / 6 = 12 MHz, inside STM32F103 ADC limit.
-     * PLL source = HSE, PLL multiplier = x9.
-     */
     RCC->CFGR = RCC_CFGR_PPRE1_DIV2 |
                 RCC_CFGR_ADCPRE_DIV6 |
                 RCC_CFGR_PLLSRC |
                 RCC_CFGR_PLLMULL9;
-#else
-    /* Use internal HSI. PLL input is HSI/2 = 4 MHz. PLL x16 gives 64 MHz. */
-    RCC->CR |= RCC_CR_HSION;
-    while ((RCC->CR & RCC_CR_HSIRDY) == 0u) {
-    }
-
-    /* Flash wait states for 64 MHz and prefetch enabled. */
-    FLASH->ACR = FLASH_ACR_PRFTBE | FLASH_ACR_LATENCY_2;
-
-    /*
-     * AHB = 64 MHz, APB2 = 64 MHz, APB1 = 32 MHz.
-     * ADC prescaler = PCLK2 / 6 = 10.67 MHz, inside STM32F103 ADC limit.
-     * PLL source bit left at 0: HSI/2. PLL multiplier = x16.
-     */
-    RCC->CFGR = RCC_CFGR_PPRE1_DIV2 |
-                RCC_CFGR_ADCPRE_DIV6 |
-                RCC_CFGR_PLLMULL16;
-#endif
 
     RCC->CR |= RCC_CR_PLLON;
-    while ((RCC->CR & RCC_CR_PLLRDY) == 0u) {
+    while ((RCC->CR & RCC_CR_PLLRDY) == 0U) {
     }
 
     RCC->CFGR = (RCC->CFGR & ~RCC_CFGR_SW) | RCC_CFGR_SW_PLL;
@@ -88,15 +47,15 @@ static void gpio_set_cr(GPIO_TypeDef *gpio, uint32_t pin, uint32_t mode_cnf)
     volatile uint32_t *cr;
     uint32_t shift;
 
-    if (pin < 8u) {
+    if (pin < 8U) {
         cr = &gpio->CRL;
-        shift = pin * 4u;
+        shift = pin * 4U;
     } else {
         cr = &gpio->CRH;
-        shift = (pin - 8u) * 4u;
+        shift = (pin - 8U) * 4U;
     }
 
-    *cr = (*cr & ~(0xFu << shift)) | ((mode_cnf & 0xFu) << shift);
+    *cr = (*cr & ~(0xFUL << shift)) | ((mode_cnf & 0xFUL) << shift);
 }
 
 static void gpio_init(void)
@@ -106,163 +65,111 @@ static void gpio_init(void)
                     RCC_APB2ENR_AFIOEN;
 
     /*
-     * PA8/PA9/PB13/PB14: alternate-function push-pull, 50 MHz.
-     * External gate-driver input pull-down resistors are mandatory.
+     * External pull-down resistors are required on every isolated gate-driver
+     * input. First test with no high DC bus and verify gate-source waveforms.
      */
-    gpio_set_cr(GPIOA, PIN_Q1_HIGH_LEFT_PIN, 0xBu);
-    gpio_set_cr(GPIOA, PIN_Q3_HIGH_RIGHT_PIN, 0xBu);
-    gpio_set_cr(GPIOB, PIN_Q2_LOW_LEFT_PIN, 0xBu);
-    gpio_set_cr(GPIOB, PIN_Q4_LOW_RIGHT_PIN, 0xBu);
+    gpio_set_cr(GPIOA, PIN_Q1_HIGH_LEFT_PIN, 0xBU);  /* PA8  AF push-pull 50 MHz */
+    gpio_set_cr(GPIOA, PIN_Q3_HIGH_RIGHT_PIN, 0xBU); /* PA9  AF push-pull 50 MHz */
+    gpio_set_cr(GPIOB, PIN_Q2_LOW_LEFT_PIN, 0xBU);   /* PB13 AF push-pull 50 MHz */
+    gpio_set_cr(GPIOB, PIN_Q4_LOW_RIGHT_PIN, 0xBU);  /* PB14 AF push-pull 50 MHz */
 
-    /* PA0 ADC1_IN0: analog input. */
-    gpio_set_cr(GPIOA, PIN_VOUT_FB_PIN, 0x0u);
+    gpio_set_cr(GPIOA, PIN_VOUT_FB_PIN, 0x0U);       /* PA0 analog input */
 
-#if ENABLE_TIM1_BKIN
-    /*
-     * PB12 TIM1_BKIN: input with pull-down. Add external comparator before
-     * serious high-power testing; firmware OVP is not cycle-by-cycle current protection.
-     */
-    gpio_set_cr(GPIOB, PIN_TIM1_BKIN_PIN, 0x8u);
-    GPIOB->BRR = (1u << PIN_TIM1_BKIN_PIN);
-#endif
+    /* PB12/TIM1_BKIN reserved for future current-trip hardware. */
+    gpio_set_cr(GPIOB, PIN_TIM1_BKIN_PIN, 0x4U);     /* Floating input for now */
 
-    /* Keep SWD pins PA13/PA14 usable; no JTAG remap is changed here. */
+    /* PA13/PA14 are untouched for SWD. */
 }
 
-static void apply_user_startup_settings(void)
+static void adc_dma_init(void)
 {
-    g_psfb_config.target_vout = USER_TARGET_OUTPUT_VOLTAGE;
-    g_psfb_config.manual_command_percent = USER_OPEN_LOOP_COMMAND_PERCENT;
-    g_psfb_config.manual_est_input_voltage = USER_EST_INPUT_VOLTAGE;
-    g_psfb_config.manual_est_output_voltage = USER_EST_OUTPUT_VOLTAGE;
-
-#if USER_ENABLE_FEEDBACK_CONTROL
-    g_psfb_config.feedback_enabled = 1u;
-    g_psfb_config.control_mode = CONTROL_MODE_CLOSED_LOOP_FEEDBACK;
-#else
-    g_psfb_config.feedback_enabled = 0u;
-    g_psfb_config.control_mode = CONTROL_MODE_OPEN_LOOP_DUTY;
-#endif
-}
-
-static void adc_init(void)
-{
+    RCC->AHBENR |= RCC_AHBENR_DMA1EN;
     RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
 
-    ADC1->CR2 = 0u;
-    ADC1->SQR1 = 0u;                         /* One conversion. */
-    ADC1->SQR3 = 0u;                         /* Rank 1 = ADC channel 0 / PA0. */
-    ADC1->SMPR2 = ADC_SMPR2_SMP0;            /* 239.5 cycles for stable divider reading. */
+    DMA1_Channel1->CCR = 0U;
+    DMA1_Channel1->CPAR = (uint32_t)&ADC1->DR;
+    DMA1_Channel1->CMAR = (uint32_t)g_adc_dma;
+    DMA1_Channel1->CNDTR = ADC_DMA_SAMPLES;
+    DMA1_Channel1->CCR = DMA_CCR_MINC |
+                         DMA_CCR_CIRC |
+                         DMA_CCR_PSIZE_0 |
+                         DMA_CCR_MSIZE_0;
+
+    ADC1->CR2 = 0U;
+    ADC1->SQR1 = 0U;
+    ADC1->SQR3 = 0U;
+    ADC1->SMPR2 = ADC_SMPR2_SMP0;            /* 239.5 ADC cycles */
 
     ADC1->CR2 |= ADC_CR2_ADON;
-    for (volatile uint32_t i = 0u; i < 10000u; i++) {
+    for (volatile uint32_t i = 0U; i < 10000U; i++) {
     }
 
     ADC1->CR2 |= ADC_CR2_RSTCAL;
-    while (ADC1->CR2 & ADC_CR2_RSTCAL) {
+    while ((ADC1->CR2 & ADC_CR2_RSTCAL) != 0U) {
     }
 
     ADC1->CR2 |= ADC_CR2_CAL;
-    while (ADC1->CR2 & ADC_CR2_CAL) {
+    while ((ADC1->CR2 & ADC_CR2_CAL) != 0U) {
     }
+
+    DMA1_Channel1->CCR |= DMA_CCR_EN;
+    ADC1->CR2 |= ADC_CR2_DMA | ADC_CR2_CONT;
+    ADC1->CR2 |= ADC_CR2_ADON;               /* Start continuous conversions. */
 }
 
-static uint16_t adc_read_pa0(void)
+static uint16_t adc_dma_average(void)
 {
-    ADC1->SQR3 = 0u;
-    ADC1->CR2 |= ADC_CR2_ADON;               /* Starts conversion in single-conversion mode. */
-    while ((ADC1->SR & ADC_SR_EOC) == 0u) {
+    uint32_t sum = 0U;
+
+    for (uint32_t i = 0U; i < ADC_DMA_SAMPLES; i++) {
+        sum += g_adc_dma[i];
     }
-    return (uint16_t)ADC1->DR;
+
+    return (uint16_t)((sum + (ADC_DMA_SAMPLES / 2U)) / ADC_DMA_SAMPLES);
 }
-
-static void adc_update_filter(void)
-{
-    uint32_t accum = 0u;
-    uint16_t raw;
-
-    /*
-     * Feedback filtering:
-     * - average several ADC conversions to reduce switching noise,
-     * - then apply a low-pass IIR filter at the 1 kHz control-loop rate,
-     * - initialize the filter from the first averaged sample so it does not
-     *   ramp from artificial zero at startup.
-     */
-    for (uint32_t i = 0u; i < ADC_OVERSAMPLE_COUNT; i++) {
-        accum += adc_read_pa0();
-    }
-    raw = (uint16_t)((accum + (ADC_OVERSAMPLE_COUNT / 2u)) / ADC_OVERSAMPLE_COUNT);
-
-    g_adc_sample.raw = raw;
-    if (!g_adc_filter_initialized) {
-        g_adc_sample.filtered = (float)raw;
-        g_adc_filter_initialized = 1u;
-    } else {
-        g_adc_sample.filtered += (((float)raw) - g_adc_sample.filtered) * ADC_IIR_ALPHA;
-    }
-    g_adc_sample.adc_voltage = (g_adc_sample.filtered * ADC_REF_VOLTAGE) / ADC_FULL_SCALE;
-    g_adc_sample.vout = g_adc_sample.adc_voltage * VOUT_FEEDBACK_SCALE;
-}
-
-#if ENABLE_IWDG
-static void iwdg_init(void)
-{
-    IWDG->KR = 0x5555u;       /* Enable write access. */
-    IWDG->PR = 4u;            /* LSI / 64. */
-    IWDG->RLR = 625u;         /* About 1 s at 40 kHz LSI. */
-    IWDG->KR = 0xAAAAu;       /* Reload. */
-    IWDG->KR = 0xCCCCu;       /* Start. */
-}
-
-static void iwdg_kick(void)
-{
-    IWDG->KR = 0xAAAAu;
-}
-#endif
 
 int main(void)
 {
     uint32_t next_control_ms;
 
-    clock_init();
-    SysTick_Config(SYSCLK_HZ / 1000u);
+    if ((TARGET_VOUT_MV < TARGET_VOUT_MIN_MV) ||
+        (TARGET_VOUT_MV > TARGET_VOUT_MAX_MV)) {
+        g_psfb.fault = FAULT_INVALID_TARGET;
+        while (1) {
+        }
+    }
+
+    clock_init_72mhz_hse();
+    SysTick_Config(TIM1_CLK_HZ / 1000UL);
 
     gpio_init();
-    adc_init();
-    apply_user_startup_settings();
-    psfb_init();
+    adc_dma_init();
+    psfb_init_timer();
 
-    psfb_set_phase_ticks(0u);
-    TIM1->EGR = TIM_EGR_UG;
-
-    for (uint32_t i = 0u; i < ADC_PREFILL_SAMPLES; i++) {
-        adc_update_filter();
+    /*
+     * Confirm before applying power:
+     * PA8/PB13 complementary with dead time.
+     * PA9/PB14 complementary with dead time.
+     * Both legs fixed 50% duty.
+     * Phase shift changes left/right diagonal overlap.
+     * Transformer primary positive/negative pulses are symmetrical.
+     * Do not test directly at 500 V.
+     */
+    for (uint32_t i = 0U; i < 200U; i++) {
+        uint16_t raw = adc_dma_average();
+        g_psfb.adc_raw = raw;
+        g_psfb.adc_filtered = raw;
+        g_psfb.vout_mv = ((((uint32_t)raw * ADC_REF_MV) / ADC_FULL_SCALE) *
+                          VOUT_FEEDBACK_SCALE_NUM) / VOUT_FEEDBACK_SCALE_DEN;
     }
 
-#if ENABLE_IWDG
-    if (RCC->CSR & RCC_CSR_IWDGRSTF) {
-        g_psfb_fault = FAULT_WATCHDOG_RESET;
-        g_psfb_state = STATE_FAULT;
-    }
-    RCC->CSR |= RCC_CSR_RMVF;
-    iwdg_init();
-#endif
-
-    psfb_start();
-    next_control_ms = millis();
+    psfb_start_outputs();
+    next_control_ms = g_ms_ticks;
 
     while (1) {
-        uint32_t now = millis();
-
-        if ((int32_t)(now - next_control_ms) >= 0) {
-            next_control_ms += CONTROL_LOOP_PERIOD_MS;
-
-            adc_update_filter();
-            psfb_control_1khz(&g_adc_sample);
-
-#if ENABLE_IWDG
-            iwdg_kick();
-#endif
+        if ((int32_t)(g_ms_ticks - next_control_ms) >= 0) {
+            next_control_ms += 1U;
+            psfb_control_1khz(TARGET_VOUT_MV, adc_dma_average());
         }
     }
 }

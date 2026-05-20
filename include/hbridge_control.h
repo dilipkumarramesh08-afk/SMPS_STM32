@@ -21,11 +21,11 @@
 #define APB2_CLK_HZ                   (SYSCLK_HZ / APB2_PRESCALER)
 #define TIM1_CLK_HZ                   ((APB2_PRESCALER == 1UL) ? APB2_CLK_HZ : (2UL * APB2_CLK_HZ))
 
-#define FSW_HZ                        18000UL
-#define CONTROL_LOOP_HZ               2000UL
-#define NORMAL_DEADTIME_NS            800UL
+#define FSW_HZ                        20000UL
+#define CONTROL_LOOP_HZ               8000UL
+#define NORMAL_DEADTIME_NS            500UL
 
-#define SOFTSTART_TIME_MS             15000UL
+#define SOFTSTART_TIME_MS             3000UL
 #define DUTY_MAX_PERMILLE             850U
 #define DUTY_SLEW_UP_LOW_PERMILLE_PER_SEC 300U
 #define DUTY_SLEW_DOWN_LOW_PERMILLE_PER_SEC 1000U
@@ -36,30 +36,30 @@
 #define FAST_CONTROL_THRESHOLD_NUM    7U
 #define FAST_CONTROL_THRESHOLD_DEN    10U
 #define PI_KP_SHIFT                   5U
-#define PI_KI_SHIFT                   7U
+#define PI_KI_SHIFT                   9U
 #define SOFTSTART_RAMP_Q_SHIFT        8U
 #define DUTY_SLEW_Q_SHIFT             8U
 
 #define OVP_MULTIPLIER_NUM            3U
 #define OVP_MULTIPLIER_DEN            2U
-#define OVP_CONFIRM_COUNT             6U
+#define OVP_CONFIRM_COUNT             24U
 #define ADC_NEAR_FULL_SCALE_LIMIT     3900U
 #define ADC_FILTER_SHIFT              2U
 #define ADC_DMA_SAMPLES               16U
 #define ADC_USE_TIM1_TRIGGER          0
 
-#define FEEDBACK_PROTECTION_BLANKING_MS 6000U
+#define FEEDBACK_PROTECTION_BLANKING_MS 4000U
 #define FEEDBACK_LOW_TIMEOUT_MS       3000U
 
 #define IRQ_PRIORITY_TIM1             0U
 #define IRQ_PRIORITY_SYSTICK          2U
 
 /*
- * Up-counting TIM1 period for scheduled H-bridge states.
- * Full PWM period = (ARR + 1) / TIM1_CLK_HZ.
+ * Center-aligned TIM1 PWM.
+ * Full bipolar PWM period = 2 * (ARR + 1) / TIM1_CLK_HZ.
  */
-#define TIM1_PERIOD_TICKS             (TIM1_CLK_HZ / FSW_HZ)
-#define TIM1_ARR_VALUE                (TIM1_PERIOD_TICKS - 1UL)
+#define TIM1_HALF_PERIOD_TICKS        (TIM1_CLK_HZ / (2UL * FSW_HZ))
+#define TIM1_ARR_VALUE                (TIM1_HALF_PERIOD_TICKS - 1UL)
 
 #if (LEFT_GATE_DRIVER_ACTIVE_HIGH != 0) && (LEFT_GATE_DRIVER_ACTIVE_HIGH != 1)
 #error "LEFT_GATE_DRIVER_ACTIVE_HIGH must be 0 or 1"

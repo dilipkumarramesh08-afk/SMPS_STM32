@@ -29,26 +29,26 @@ Do not run high power until current sensing and hardware shutdown are added.
 
 ## Waveform
 
-TIM1 schedules one bipolar switching period as:
+TIM1 generates one center-aligned bipolar switching period in hardware:
 
 ```text
 Q1 + Q4 ON -> +VIN across transformer primary
-all OFF
+Q2 + Q4 ON -> zero/freewheel state
 Q2 + Q3 ON -> -VIN across transformer primary
-all OFF
+Q2 + Q4 ON -> zero/freewheel state
 repeat
 ```
 
-Positive and negative pulse widths are always equal. Q1/Q2 and Q3/Q4 are never intentionally enabled together.
+Positive and negative pulse widths are always equal. Q1/Q2 and Q3/Q4 are never intentionally enabled together. TIM1 complementary outputs provide same-leg dead time in hardware.
 
 ## Active Defaults
 
 ```c
 #define TARGET_VOUT_MV 26000U
-#define FSW_HZ 18000UL
-#define CONTROL_LOOP_HZ 2000UL
-#define NORMAL_DEADTIME_NS 800UL
-#define SOFTSTART_TIME_MS 15000UL
+#define FSW_HZ 20000UL
+#define CONTROL_LOOP_HZ 8000UL
+#define NORMAL_DEADTIME_NS 500UL
+#define SOFTSTART_TIME_MS 3000UL
 #define DUTY_MAX_PERMILLE 850U
 ```
 
@@ -78,34 +78,34 @@ maximum measurable output -> about 36.3 V
 
 The only active operating mode is closed-loop voltage control from PA0.
 
-- soft-start from 0 V to target over 15 seconds
-- 2 kHz PI control loop from SysTick
+- soft-start from 0 V to target over 3 seconds
+- 8 kHz PI control loop from SysTick
 - fractional soft-start ramp accumulator
 - duty slew below 70% target: up 300 permille/sec, down 1000 permille/sec
 - duty slew above 70% target: up 3000 permille/sec, down 8000 permille/sec
-- fractional duty-slew accumulator keeps those rates correct at 2 kHz
+- fractional duty-slew accumulator keeps those rates correct at 8 kHz
 - 25 mV voltage deadband
 - PI anti-windup
 - ADC1 continuous sampling
 - DMA1_Channel1 circular ADC buffer averaging plus IIR filtering
-- TIM1 update/compare interrupts run at highest firmware priority
+- TIM1 center-aligned PWM generates bridge timing in hardware
 - SysTick control-loop interrupt runs below TIM1 priority
 - soft-start step and OVP limit are cached after target setup
 
-TIM1 compare usage:
+TIM1 PWM usage:
 
 ```text
-update -> Q1 + Q4 ON
-CCR1   -> all OFF
-CCR2   -> Q2 + Q3 ON
-CCR4   -> all OFF
+CH1 PWM1  -> Q1 near counter zero
+CH1N      -> Q2 complementary with dead time
+CH2 PWM2  -> Q3 near counter ARR
+CH2N      -> Q4 complementary with dead time
 ```
 
 PI terms:
 
 ```text
 P = error_mv >> 5
-I update = error_mv >> 7
+I update = error_mv >> 9
 ```
 
 Useful ST-LINK watch fields:
@@ -144,9 +144,9 @@ OVP:
 OVP = TARGET_VOUT_MV * 1.5
 ```
 
-For the 26 V target, OVP is 39 V. OVP must be detected on 6 consecutive 2 kHz control-loop readings before shutdown. ADC near-full-scale protection trips above raw ADC 3900.
+For the 26 V target, OVP is 39 V. OVP must be detected on 24 consecutive 8 kHz control-loop readings before shutdown. ADC near-full-scale protection trips above raw ADC 3900.
 
-Low-feedback protection is blanked for 6000 ms after startup. After blanking, PA0 must remain almost zero for 3000 ms before the feedback-low fault latches.
+Low-feedback protection is blanked for 4000 ms after startup. After blanking, PA0 must remain almost zero for 3000 ms before the feedback-low fault latches.
 
 ## Build
 

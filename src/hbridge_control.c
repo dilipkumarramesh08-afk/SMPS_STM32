@@ -11,9 +11,9 @@ enum {
                               TIM_CCER_CC2P | TIM_CCER_CC2NP
 };
 
-static uint16_t s_period_ticks = 0;
-static volatile uint16_t s_pulse_ticks = 0;
-static volatile uint8_t s_outputs_armed = 0;
+static uint16_t s_half_period_ticks = 0;
+static volatile uint16_t s_active_half_ticks = 0;
+static volatile uint8_t s_outputs_allowed = 0;
 static int32_t s_integrator_q8 = 0;
 static uint32_t s_ramp_target_mv_q = 0;
 static uint32_t s_ramp_config_target_mv = 0;
@@ -28,7 +28,7 @@ static uint8_t s_ovp_confirm_count = 0;
 
 static inline void hbridge_emergency_shutdown(void)
 {
-    s_outputs_armed = 0U;
+    s_outputs_allowed = 0U;
     TIM1->BDTR &= ~TIM_BDTR_MOE;
     g_hbridge.duty_actual_permille = 0U;
     g_hbridge.duty_cmd_permille = 0U;
@@ -74,46 +74,16 @@ static uint32_t tim1_off_state_bits(void)
     return bits;
 }
 
-static void tim1_force_outputs_idle(void)
-{
-    s_outputs_armed = 0U;
-    TIM1->BDTR &= ~TIM_BDTR_MOE;
-}
-
-static void tim1_arm_outputs_if_allowed(uint16_t duty_permille)
-{
-    if ((duty_permille > 0U) && (g_hbridge.fault == FAULT_NONE)) {
-        s_outputs_armed = 1U;
-    }
-}
-
-static void tim1_set_oc_modes(uint32_t oc1_mode, uint32_t oc2_mode)
-{
-    TIM1->CCMR1 = (TIM1->CCMR1 &
-                   ~(TIM_CCMR1_OC1M_Msk | TIM_CCMR1_OC2M_Msk)) |
-                  ((oc1_mode << TIM_CCMR1_OC1M_Pos) |
-                   (oc2_mode << TIM_CCMR1_OC2M_Pos));
-}
-
-static void hbridge_all_off(void)
+static void tim1_disable_outputs(void)
 {
     TIM1->BDTR &= ~TIM_BDTR_MOE;
 }
 
-static void hbridge_positive_on(void)
+static void tim1_enable_outputs_if_allowed(uint16_t duty_permille)
 {
-    if ((s_outputs_armed != 0U) && (g_hbridge.fault == FAULT_NONE)) {
-        hbridge_all_off();
-        tim1_set_oc_modes(5U, 4U);   /* CH1 active, CH2 inactive -> Q1 + Q4. */
-        TIM1->BDTR |= TIM_BDTR_MOE;
-    }
-}
-
-static void hbridge_negative_on(void)
-{
-    if ((s_outputs_armed != 0U) && (g_hbridge.fault == FAULT_NONE)) {
-        hbridge_all_off();
-        tim1_set_oc_modes(4U, 5U);   /* CH1 inactive, CH2 active -> Q2 + Q3. */
+    if ((s_outputs_allowed != 0U) &&
+        (duty_permille > 0U) &&
+        (g_hbridge.fault == FAULT_NONE)) {
         TIM1->BDTR |= TIM_BDTR_MOE;
     }
 }
@@ -162,20 +132,18 @@ uint8_t hbridge_deadtime_dtg(void)
 
 void hbridge_set_duty_permille(uint16_t duty_permille)
 {
-    uint32_t pulse_permille;
-    uint32_t pulse_ticks;
-    uint32_t half_period;
-    uint32_t negative_off_edge;
+    uint32_t active_half_ticks;
+    uint32_t right_leg_rising_edge;
 
     if (duty_permille > DUTY_MAX_PERMILLE) {
         duty_permille = DUTY_MAX_PERMILLE;
     }
 
     if (duty_permille == 0U) {
-        tim1_force_outputs_idle();
-        s_pulse_ticks = 0U;
+        tim1_disable_outputs();
+        s_active_half_ticks = 0U;
         TIM1->CCR1 = 0U;
-        TIM1->CCR2 = 0U;
+        TIM1->CCR2 = TIM1->ARR;
         TIM1->CCR3 = 0U;
         TIM1->CCR4 = 0U;
         g_hbridge.duty_actual_permille = 0U;
@@ -183,28 +151,34 @@ void hbridge_set_duty_permille(uint16_t duty_permille)
     }
 
     /*
-     * duty_permille is total bipolar active duty.
-     * +VIN and -VIN pulse widths are each duty/2.
+     * Center-aligned bipolar PWM:
+     * - CH1 PWM1 creates Q1 around the counter zero boundary.
+     * - CH2 PWM2 creates Q3 around the counter ARR boundary.
+     * - Complementary outputs create Q2/Q4 with TIM1 hardware dead time.
+     *
+     * duty_permille is total active transformer duty.
+     * Each polarity receives the same pulse width.
      */
-    pulse_permille = (uint32_t)duty_permille / 2UL;
-    pulse_ticks = (pulse_permille * s_period_ticks) / 1000UL;
-    half_period = (uint32_t)s_period_ticks / 2UL;
-    if (pulse_ticks >= half_period) {
-        pulse_ticks = half_period - 1UL;
+    active_half_ticks = ((uint32_t)duty_permille * s_half_period_ticks) / 2000UL;
+    if (active_half_ticks == 0UL) {
+        active_half_ticks = 1UL;
+    }
+    if (active_half_ticks >= (s_half_period_ticks / 2UL)) {
+        active_half_ticks = (s_half_period_ticks / 2UL) - 1UL;
     }
 
-    negative_off_edge = half_period + pulse_ticks;
-    if (negative_off_edge > TIM1->ARR) {
-        negative_off_edge = TIM1->ARR;
+    right_leg_rising_edge = s_half_period_ticks - active_half_ticks - 1UL;
+    if (right_leg_rising_edge > TIM1->ARR) {
+        right_leg_rising_edge = TIM1->ARR;
     }
 
-    s_pulse_ticks = (uint16_t)pulse_ticks;
-    TIM1->CCR1 = (uint16_t)pulse_ticks;
-    TIM1->CCR2 = (uint16_t)half_period;
+    s_active_half_ticks = (uint16_t)active_half_ticks;
+    TIM1->CCR1 = (uint16_t)active_half_ticks;
+    TIM1->CCR2 = (uint16_t)right_leg_rising_edge;
     TIM1->CCR3 = 0U;
-    TIM1->CCR4 = (uint16_t)negative_off_edge;
+    TIM1->CCR4 = 0U;
     g_hbridge.duty_actual_permille = duty_permille;
-    tim1_arm_outputs_if_allowed(duty_permille);
+    tim1_enable_outputs_if_allowed(duty_permille);
 }
 
 void hbridge_latch_fault(fault_t fault)
@@ -229,18 +203,20 @@ void hbridge_init_timer(void)
     TIM1->RCR = 0U;
     TIM1->PSC = 0U;
 
-    s_period_ticks = (uint16_t)(TIM1_ARR_VALUE + 1UL);
+    s_half_period_ticks = (uint16_t)(TIM1_ARR_VALUE + 1UL);
     TIM1->ARR = (uint16_t)TIM1_ARR_VALUE;
 
     /*
-     * Scheduled H-bridge states:
-     * update: Q1 + Q4 positive pulse
-     * CC1:    all off
-     * CC2:    Q2 + Q3 negative pulse
-     * CC4:    all off
+     * Center-aligned hardware waveform:
+     * CNT near 0:   Q1 + Q4 positive transformer pulse.
+     * Mid-slope:    Q2 + Q4 zero/freewheel state.
+     * CNT near ARR: Q2 + Q3 negative transformer pulse.
+     * Mid-slope:    Q2 + Q4 zero/freewheel state.
      */
-    ccmr1 = (4U << TIM_CCMR1_OC1M_Pos) |
-            (4U << TIM_CCMR1_OC2M_Pos);
+    ccmr1 = TIM_CCMR1_OC1PE |
+            TIM_CCMR1_OC2PE |
+            (6U << TIM_CCMR1_OC1M_Pos) |
+            (7U << TIM_CCMR1_OC2M_Pos);
     TIM1->CCMR1 = ccmr1;
     TIM1->CCMR2 = 0U;
     TIM1->CCER = TIM1_CCER_OUTPUT_ENABLES | tim1_output_polarity_bits();
@@ -250,52 +226,15 @@ void hbridge_init_timer(void)
 
     TIM1->EGR = TIM_EGR_UG;
     TIM1->SR = 0U;
-    TIM1->DIER = TIM_DIER_UIE | TIM_DIER_CC1IE | TIM_DIER_CC2IE | TIM_DIER_CC4IE;
-    NVIC_SetPriority(TIM1_UP_TIM10_IRQn, IRQ_PRIORITY_TIM1);
-    NVIC_SetPriority(TIM1_CC_IRQn, IRQ_PRIORITY_TIM1);
-    NVIC_EnableIRQ(TIM1_UP_TIM10_IRQn);
-    NVIC_EnableIRQ(TIM1_CC_IRQn);
-    TIM1->CR1 = TIM_CR1_ARPE | TIM_CR1_CEN;
+    TIM1->DIER = 0U;
+    TIM1->CR1 = TIM_CR1_ARPE | TIM_CR1_CMS_0 | TIM_CR1_CEN;
 }
 
 void hbridge_start_outputs(void)
 {
-    tim1_arm_outputs_if_allowed(g_hbridge.duty_actual_permille);
-}
-
-void TIM1_UP_IRQHandler(void)
-{
-    if ((TIM1->SR & TIM_SR_UIF) != 0U) {
-        TIM1->SR &= ~TIM_SR_UIF;
-        if (s_pulse_ticks > 0U) {
-            hbridge_positive_on();
-        } else {
-            hbridge_all_off();
-        }
-    }
-}
-
-void TIM1_CC_IRQHandler(void)
-{
-    uint32_t sr = TIM1->SR;
-
-    if ((sr & TIM_SR_CC1IF) != 0U) {
-        TIM1->SR &= ~TIM_SR_CC1IF;
-        hbridge_all_off();
-    }
-
-    if ((sr & TIM_SR_CC2IF) != 0U) {
-        TIM1->SR &= ~TIM_SR_CC2IF;
-        if (s_pulse_ticks > 0U) {
-            hbridge_negative_on();
-        } else {
-            hbridge_all_off();
-        }
-    }
-
-    if ((sr & TIM_SR_CC4IF) != 0U) {
-        TIM1->SR &= ~TIM_SR_CC4IF;
-        hbridge_all_off();
+    if (g_hbridge.fault == FAULT_NONE) {
+        s_outputs_allowed = 1U;
+        tim1_enable_outputs_if_allowed(g_hbridge.duty_actual_permille);
     }
 }
 

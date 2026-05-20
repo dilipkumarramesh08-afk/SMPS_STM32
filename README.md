@@ -33,23 +33,28 @@ TIM1 generates one center-aligned bipolar switching period in hardware:
 
 ```text
 Q1 + Q4 ON -> +VIN across transformer primary
-Q2 + Q4 ON -> zero/freewheel state
+Q2 + Q4 or Q1 + Q3 -> zero/freewheel state
 Q2 + Q3 ON -> -VIN across transformer primary
-Q2 + Q4 ON -> zero/freewheel state
+Q1 + Q3 or Q2 + Q4 -> zero/freewheel state
 repeat
 ```
 
 Positive and negative pulse widths are always equal. Q1/Q2 and Q3/Q4 are never intentionally enabled together. TIM1 complementary outputs provide same-leg dead time in hardware.
 
+`ENABLE_ALTERNATING_FREEWHEEL` alternates the zero/freewheel state between low-side freewheel `Q2+Q4` and high-side freewheel `Q1+Q3` at TIM1 update boundaries. This keeps transformer volt-seconds balanced while sharing zero-state conduction between devices.
+
 ## Active Defaults
 
 ```c
-#define TARGET_VOUT_MV 26000U
+#define TARGET_VOUT_MV 28000U
 #define FSW_HZ 20000UL
 #define CONTROL_LOOP_HZ 8000UL
-#define NORMAL_DEADTIME_NS 500UL
+#define NORMAL_DEADTIME_NS 400UL
 #define SOFTSTART_TIME_MS 3000UL
 #define DUTY_MAX_PERMILLE 850U
+#define DUTY_LIMIT_NEAR_TARGET_PERMILLE 800U
+#define DUTY_LIMIT_ABOVE_TARGET_PERMILLE 650U
+#define ENABLE_ALTERNATING_FREEWHEEL 1U
 ```
 
 The duty command is total bipolar active duty. At the 850 permille limit, each transformer polarity pulse can reach about 42.5% of the switching period.
@@ -84,11 +89,14 @@ The only active operating mode is closed-loop voltage control from PA0.
 - duty slew below 70% target: up 300 permille/sec, down 1000 permille/sec
 - duty slew above 70% target: up 3000 permille/sec, down 8000 permille/sec
 - fractional duty-slew accumulator keeps those rates correct at 8 kHz
+- dynamic duty ceiling: 850 permille during soft-start/low/mid output, 800 above 95% target, 650 at or above target
 - 25 mV voltage deadband
 - PI anti-windup
 - ADC1 continuous sampling
-- DMA1_Channel1 circular ADC buffer averaging plus IIR filtering
+- DMA1_Channel1 circular ADC buffer averaging
+- adaptive ADC IIR filter: fast shift 1 when raw delta is 8 counts or more, slow shift 3 when steady
 - TIM1 center-aligned PWM generates bridge timing in hardware
+- TIM1 update interrupt selects the next synchronous freewheel state only
 - SysTick control-loop interrupt runs below TIM1 priority
 - soft-start step and OVP limit are cached after target setup
 
@@ -116,6 +124,8 @@ g_hbridge.target_ramped_mv
 g_hbridge.error_mv
 g_hbridge.duty_target_permille
 g_hbridge.duty_actual_permille
+g_hbridge.duty_limit_permille
+g_hbridge.freewheel_state
 g_hbridge.fault
 ```
 
@@ -144,7 +154,7 @@ OVP:
 OVP = TARGET_VOUT_MV * 1.5
 ```
 
-For the 26 V target, OVP is 39 V. OVP must be detected on 24 consecutive 8 kHz control-loop readings before shutdown. ADC near-full-scale protection trips above raw ADC 3900.
+For the 28 V target, OVP is 42 V. OVP must be detected on 24 consecutive 8 kHz control-loop readings before shutdown. ADC near-full-scale protection trips above raw ADC 3900.
 
 Low-feedback protection is blanked for 4000 ms after startup. After blanking, PA0 must remain almost zero for 3000 ms before the feedback-low fault latches.
 

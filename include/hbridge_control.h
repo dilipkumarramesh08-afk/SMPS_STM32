@@ -23,10 +23,14 @@
 
 #define FSW_HZ                        20000UL
 #define CONTROL_LOOP_HZ               8000UL
-#define NORMAL_DEADTIME_NS            500UL
+#define NORMAL_DEADTIME_NS            400UL
 
 #define SOFTSTART_TIME_MS             3000UL
 #define DUTY_MAX_PERMILLE             850U
+#define DUTY_LIMIT_LOW_VOUT_PERMILLE  DUTY_MAX_PERMILLE
+#define DUTY_LIMIT_MID_VOUT_PERMILLE  DUTY_MAX_PERMILLE
+#define DUTY_LIMIT_NEAR_TARGET_PERMILLE 800U
+#define DUTY_LIMIT_ABOVE_TARGET_PERMILLE 650U
 #define DUTY_SLEW_UP_LOW_PERMILLE_PER_SEC 300U
 #define DUTY_SLEW_DOWN_LOW_PERMILLE_PER_SEC 1000U
 #define DUTY_SLEW_UP_HIGH_PERMILLE_PER_SEC 3000U
@@ -44,9 +48,15 @@
 #define OVP_MULTIPLIER_DEN            2U
 #define OVP_CONFIRM_COUNT             24U
 #define ADC_NEAR_FULL_SCALE_LIMIT     3900U
-#define ADC_FILTER_SHIFT              2U
+#define ADC_FILTER_FAST_SHIFT         1U
+#define ADC_FILTER_SLOW_SHIFT         3U
+#define ADC_FILTER_FAST_DELTA_RAW     8U
 #define ADC_DMA_SAMPLES               16U
 #define ADC_USE_TIM1_TRIGGER          0
+
+#define ENABLE_ALTERNATING_FREEWHEEL  1U
+#define FREEWHEEL_STATE_LOW_SIDE      0U
+#define FREEWHEEL_STATE_HIGH_SIDE     1U
 
 #define FEEDBACK_PROTECTION_BLANKING_MS 4000U
 #define FEEDBACK_LOW_TIMEOUT_MS       3000U
@@ -87,6 +97,8 @@ typedef struct {
     uint16_t duty_cmd_permille;
     uint16_t duty_target_permille;
     uint16_t duty_actual_permille;
+    uint16_t duty_limit_permille;
+    uint8_t freewheel_state;
     fault_t fault;
 } hbridge_status_t;
 

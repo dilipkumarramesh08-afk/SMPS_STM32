@@ -14,6 +14,7 @@ enum {
 static uint16_t s_half_period_ticks = 0;
 static volatile uint16_t s_active_half_ticks = 0;
 static volatile uint8_t s_outputs_allowed = 0;
+static volatile uint8_t s_freewheel_state = FREEWHEEL_STATE_LOW_SIDE;
 static int32_t s_integrator_q8 = 0;
 static uint32_t s_ramp_target_mv_q = 0;
 static uint32_t s_ramp_config_target_mv = 0;
@@ -33,6 +34,7 @@ static inline void hbridge_emergency_shutdown(void)
     g_hbridge.duty_actual_permille = 0U;
     g_hbridge.duty_cmd_permille = 0U;
     g_hbridge.duty_target_permille = 0U;
+    g_hbridge.duty_limit_permille = 0U;
     g_hbridge.target_ramped_mv = 0U;
     g_hbridge.error_mv = 0;
     s_integrator_q8 = 0;
@@ -88,6 +90,35 @@ static void tim1_enable_outputs_if_allowed(uint16_t duty_permille)
     }
 }
 
+static uint32_t tim1_near_arr_edge(uint16_t active_half_ticks)
+{
+    uint32_t edge = (uint32_t)s_half_period_ticks - active_half_ticks - 1UL;
+    return (edge > TIM1->ARR) ? TIM1->ARR : edge;
+}
+
+static void tim1_apply_freewheel_state(uint8_t freewheel_state)
+{
+    uint16_t active_half_ticks = s_active_half_ticks;
+    uint32_t near_arr_edge;
+
+    if (active_half_ticks == 0U) {
+        TIM1->CCR1 = 0U;
+        TIM1->CCR2 = TIM1->ARR;
+        return;
+    }
+
+    near_arr_edge = tim1_near_arr_edge(active_half_ticks);
+    if (freewheel_state == FREEWHEEL_STATE_HIGH_SIDE) {
+        TIM1->CCR1 = (uint16_t)near_arr_edge;
+        TIM1->CCR2 = active_half_ticks;
+        g_hbridge.freewheel_state = FREEWHEEL_STATE_HIGH_SIDE;
+    } else {
+        TIM1->CCR1 = active_half_ticks;
+        TIM1->CCR2 = (uint16_t)near_arr_edge;
+        g_hbridge.freewheel_state = FREEWHEEL_STATE_LOW_SIDE;
+    }
+}
+
 uint32_t hbridge_adc_raw_to_vout_mv(uint16_t adc_raw)
 {
     uint32_t adc_mv = ((uint32_t)adc_raw * ADC_REF_MV) / ADC_FULL_SCALE;
@@ -133,7 +164,6 @@ uint8_t hbridge_deadtime_dtg(void)
 void hbridge_set_duty_permille(uint16_t duty_permille)
 {
     uint32_t active_half_ticks;
-    uint32_t right_leg_rising_edge;
 
     if (duty_permille > DUTY_MAX_PERMILLE) {
         duty_permille = DUTY_MAX_PERMILLE;
@@ -147,6 +177,7 @@ void hbridge_set_duty_permille(uint16_t duty_permille)
         TIM1->CCR3 = 0U;
         TIM1->CCR4 = 0U;
         g_hbridge.duty_actual_permille = 0U;
+        g_hbridge.freewheel_state = s_freewheel_state;
         return;
     }
 
@@ -167,16 +198,12 @@ void hbridge_set_duty_permille(uint16_t duty_permille)
         active_half_ticks = (s_half_period_ticks / 2UL) - 1UL;
     }
 
-    right_leg_rising_edge = s_half_period_ticks - active_half_ticks - 1UL;
-    if (right_leg_rising_edge > TIM1->ARR) {
-        right_leg_rising_edge = TIM1->ARR;
-    }
-
     s_active_half_ticks = (uint16_t)active_half_ticks;
-    TIM1->CCR1 = (uint16_t)active_half_ticks;
-    TIM1->CCR2 = (uint16_t)right_leg_rising_edge;
     TIM1->CCR3 = 0U;
     TIM1->CCR4 = 0U;
+    if (s_outputs_allowed == 0U) {
+        tim1_apply_freewheel_state(s_freewheel_state);
+    }
     g_hbridge.duty_actual_permille = duty_permille;
     tim1_enable_outputs_if_allowed(duty_permille);
 }
@@ -209,9 +236,9 @@ void hbridge_init_timer(void)
     /*
      * Center-aligned hardware waveform:
      * CNT near 0:   Q1 + Q4 positive transformer pulse.
-     * Mid-slope:    Q2 + Q4 zero/freewheel state.
+     * Mid-slope:    selected zero/freewheel state.
      * CNT near ARR: Q2 + Q3 negative transformer pulse.
-     * Mid-slope:    Q2 + Q4 zero/freewheel state.
+     * Mid-slope:    selected zero/freewheel state.
      */
     ccmr1 = TIM_CCMR1_OC1PE |
             TIM_CCMR1_OC2PE |
@@ -226,7 +253,9 @@ void hbridge_init_timer(void)
 
     TIM1->EGR = TIM_EGR_UG;
     TIM1->SR = 0U;
-    TIM1->DIER = 0U;
+    TIM1->DIER = TIM_DIER_UIE;
+    NVIC_SetPriority(TIM1_UP_TIM10_IRQn, IRQ_PRIORITY_TIM1);
+    NVIC_EnableIRQ(TIM1_UP_TIM10_IRQn);
     TIM1->CR1 = TIM_CR1_ARPE | TIM_CR1_CMS_0 | TIM_CR1_CEN;
 }
 
@@ -238,9 +267,46 @@ void hbridge_start_outputs(void)
     }
 }
 
+void TIM1_UP_IRQHandler(void)
+{
+    if ((TIM1->SR & TIM_SR_UIF) == 0U) {
+        return;
+    }
+
+    TIM1->SR &= ~TIM_SR_UIF;
+
+#if ENABLE_ALTERNATING_FREEWHEEL
+    s_freewheel_state =
+        (s_freewheel_state == FREEWHEEL_STATE_LOW_SIDE) ?
+        FREEWHEEL_STATE_HIGH_SIDE : FREEWHEEL_STATE_LOW_SIDE;
+#else
+    s_freewheel_state = FREEWHEEL_STATE_LOW_SIDE;
+#endif
+
+    tim1_apply_freewheel_state(s_freewheel_state);
+    tim1_enable_outputs_if_allowed(g_hbridge.duty_actual_permille);
+}
+
 static uint32_t ms_to_control_ticks(uint32_t ms)
 {
     return (ms * CONTROL_LOOP_HZ) / 1000UL;
+}
+
+static uint16_t adc_iir_filter(uint16_t previous, uint16_t sample)
+{
+    int32_t delta = (int32_t)sample - (int32_t)previous;
+    uint32_t abs_delta = (delta < 0) ? (uint32_t)(-delta) : (uint32_t)delta;
+    uint32_t shift = (abs_delta >= ADC_FILTER_FAST_DELTA_RAW) ?
+        ADC_FILTER_FAST_SHIFT : ADC_FILTER_SLOW_SHIFT;
+    int32_t step;
+
+    if (delta >= 0) {
+        step = (delta + (int32_t)(1UL << (shift - 1U))) >> shift;
+    } else {
+        step = -(((-delta) + (int32_t)(1UL << (shift - 1U))) >> shift);
+    }
+
+    return (uint16_t)((int32_t)previous + step);
 }
 
 static uint16_t pi_controller(int32_t error_mv, uint16_t max_permille)
@@ -350,6 +416,26 @@ static uint16_t active_slew_down_permille(void)
     return DUTY_SLEW_DOWN_LOW_PERMILLE_PER_SEC;
 }
 
+static uint16_t dynamic_duty_limit_permille(uint32_t target_vout_mv)
+{
+    uint32_t threshold_70 = (target_vout_mv * 70UL) / 100UL;
+    uint32_t threshold_95 = (target_vout_mv * 95UL) / 100UL;
+
+    if (g_hbridge.target_ramped_mv < target_vout_mv) {
+        return DUTY_MAX_PERMILLE;
+    }
+    if (g_hbridge.vout_mv >= target_vout_mv) {
+        return DUTY_LIMIT_ABOVE_TARGET_PERMILLE;
+    }
+    if (g_hbridge.vout_mv >= threshold_95) {
+        return DUTY_LIMIT_NEAR_TARGET_PERMILLE;
+    }
+    if (g_hbridge.vout_mv >= threshold_70) {
+        return DUTY_LIMIT_MID_VOUT_PERMILLE;
+    }
+    return DUTY_LIMIT_LOW_VOUT_PERMILLE;
+}
+
 static uint16_t slew_steps_from_rate(uint16_t permille_per_sec, uint32_t *accum_q)
 {
     uint32_t step_q =
@@ -375,6 +461,7 @@ static void update_target_cache(uint32_t target_vout_mv)
 void hbridge_control_step(uint32_t target_vout_mv, uint16_t adc_raw)
 {
     uint16_t duty_cmd;
+    uint16_t duty_limit;
     uint16_t slew_up;
     uint16_t slew_down;
     int32_t error_mv;
@@ -401,9 +488,7 @@ void hbridge_control_step(uint32_t target_vout_mv, uint16_t adc_raw)
     if (g_hbridge.adc_filtered == 0U) {
         g_hbridge.adc_filtered = adc_raw;
     } else {
-        int32_t delta = (int32_t)adc_raw - (int32_t)g_hbridge.adc_filtered;
-        g_hbridge.adc_filtered = (uint16_t)((int32_t)g_hbridge.adc_filtered +
-                                            (delta >> ADC_FILTER_SHIFT));
+        g_hbridge.adc_filtered = adc_iir_filter(g_hbridge.adc_filtered, adc_raw);
     }
 
     g_hbridge.vout_mv = hbridge_adc_raw_to_vout_mv(g_hbridge.adc_filtered);
@@ -423,6 +508,8 @@ void hbridge_control_step(uint32_t target_vout_mv, uint16_t adc_raw)
     }
 
     update_softstart_target(target_vout_mv);
+    duty_limit = dynamic_duty_limit_permille(target_vout_mv);
+    g_hbridge.duty_limit_permille = duty_limit;
 
     error_mv = (int32_t)g_hbridge.target_ramped_mv - (int32_t)g_hbridge.vout_mv;
     g_hbridge.error_mv = error_mv;
@@ -431,7 +518,7 @@ void hbridge_control_step(uint32_t target_vout_mv, uint16_t adc_raw)
         (error_mv < (int32_t)VOUT_CONTROL_DEADBAND_MV)) {
         duty_cmd = g_hbridge.duty_actual_permille;
     } else {
-        duty_cmd = pi_controller(error_mv, DUTY_MAX_PERMILLE);
+        duty_cmd = pi_controller(error_mv, duty_limit);
     }
 
     if ((feedback_blank_active == 0U) &&
@@ -446,8 +533,8 @@ void hbridge_control_step(uint32_t target_vout_mv, uint16_t adc_raw)
         s_feedback_low_ms = 0U;
     }
 
-    if (duty_cmd > DUTY_MAX_PERMILLE) {
-        duty_cmd = DUTY_MAX_PERMILLE;
+    if (duty_cmd > duty_limit) {
+        duty_cmd = duty_limit;
     }
 
     if (duty_cmd > g_hbridge.duty_actual_permille) {

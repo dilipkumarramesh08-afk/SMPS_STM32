@@ -2,7 +2,7 @@
  * Change only this value to set output voltage.
  * Allowed range: 12000U to 28000U.
  */
-#define TARGET_VOUT_MV 26000U
+#define TARGET_VOUT_MV 28000U
 
 #include "hbridge_control.h"
 #include "board_pins.h"

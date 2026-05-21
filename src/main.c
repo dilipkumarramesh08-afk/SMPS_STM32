@@ -1,10 +1,10 @@
 /*
  * Change only this value to set output voltage.
- * Allowed range: 12000U to 28000U.
+ * Allowed range: 12000U to 30000U.
  */
-#define TARGET_VOUT_MV 28000U
+#define TARGET_VOUT_MV 30000U
 
-#include "hbridge_control.h"
+#include "psfb_control.h"
 #include "board_pins.h"
 
 #include "stm32f1xx.h"
@@ -121,8 +121,9 @@ static void gpio_init(void)
 static void delay_ms(uint32_t ms)
 {
     uint32_t start = g_control_ticks;
+    uint32_t ticks = ((ms * CONTROL_LOOP_HZ) + 999UL) / 1000UL;
 
-    while ((uint32_t)(g_control_ticks - start) < ms) {
+    while ((uint32_t)(g_control_ticks - start) < ticks) {
     }
 }
 
@@ -184,7 +185,7 @@ static void adc1_init(void)
     ADC1->CR2 = 0U;
     ADC1->SQR1 = 0U;
     ADC1->SQR3 = 0U;
-    ADC1->SMPR2 = ADC_SMPR2_SMP0;
+    ADC1->SMPR2 = ADC_SMPR2_CH0_55_5_CYCLES;
 
     ADC1->CR2 = ADC_CR2_ADON;
     for (volatile uint32_t i = 0U; i < 10000U; i++) {
@@ -199,8 +200,16 @@ static void adc1_init(void)
     }
 
     DMA1_Channel1->CCR |= DMA_CCR_EN;
+#if ADC_USE_TIM1_TRIGGER
+    ADC1->SR = 0U;
+    ADC1->CR2 = ADC_CR2_DMA |
+                ADC_CR2_EXTSEL_1 |
+                ADC_CR2_EXTTRIG |
+                ADC_CR2_ADON;
+#else
     ADC1->CR2 = ADC_CR2_DMA | ADC_CR2_CONT | ADC_CR2_ADON;
     ADC1->CR2 |= ADC_CR2_ADON;       /* Start continuous conversions. */
+#endif
 
     for (volatile uint32_t i = 0U; i < 10000U; i++) {
     }
@@ -209,12 +218,28 @@ static void adc1_init(void)
 static uint16_t adc1_latest_raw(void)
 {
     uint32_t sum = 0U;
+    uint16_t min_raw = 0xFFFFU;
+    uint16_t max_raw = 0U;
 
     for (uint32_t i = 0U; i < ADC_DMA_SAMPLES; i++) {
-        sum += g_adc_dma[i];
+        uint16_t sample = g_adc_dma[i];
+
+        sum += sample;
+        if (sample < min_raw) {
+            min_raw = sample;
+        }
+        if (sample > max_raw) {
+            max_raw = sample;
+        }
     }
 
+#if ADC_DMA_SAMPLES > 2U
+    sum -= min_raw;
+    sum -= max_raw;
+    return (uint16_t)((sum + ((ADC_DMA_SAMPLES - 2U) / 2U)) / (ADC_DMA_SAMPLES - 2U));
+#else
     return (uint16_t)((sum + (ADC_DMA_SAMPLES / 2U)) / ADC_DMA_SAMPLES);
+#endif
 }
 
 static void latch_startup_fault_if_needed(uint16_t adc_raw)
@@ -223,19 +248,19 @@ static void latch_startup_fault_if_needed(uint16_t adc_raw)
 
     if ((TARGET_VOUT_MV < TARGET_VOUT_MIN_MV) ||
         (TARGET_VOUT_MV > TARGET_VOUT_MAX_MV)) {
-        hbridge_latch_fault(FAULT_INVALID_TARGET);
+        psfb_latch_fault(FAULT_INVALID_TARGET);
         return;
     }
 
-    vout_mv = hbridge_adc_raw_to_vout_mv(adc_raw);
-    g_hbridge.adc_raw = adc_raw;
-    g_hbridge.adc_filtered = adc_raw;
-    g_hbridge.vout_mv = vout_mv;
+    vout_mv = psfb_adc_raw_to_vout_mv(adc_raw);
+    g_psfb.adc_raw = adc_raw;
+    g_psfb.adc_filtered = adc_raw;
+    g_psfb.vout_mv = vout_mv;
 
     if (adc_raw > ADC_NEAR_FULL_SCALE_LIMIT) {
-        hbridge_latch_fault(FAULT_ADC_NEAR_FULL_SCALE);
-    } else if (vout_mv > hbridge_ovp_limit_mv(TARGET_VOUT_MV)) {
-        hbridge_latch_fault(FAULT_OVERVOLTAGE);
+        psfb_latch_fault(FAULT_ADC_NEAR_FULL_SCALE);
+    } else if (vout_mv > psfb_ovp_limit_mv(TARGET_VOUT_MV)) {
+        psfb_latch_fault(FAULT_OVERVOLTAGE);
     }
 }
 
@@ -249,25 +274,25 @@ int main(void)
 
     gpio_init();
     adc1_init();
-    hbridge_init_timer();
-    hbridge_set_duty_permille(DUTY_START_PERMILLE);
+    psfb_init_timer();
+    psfb_set_phase_permille(PSFB_PHASE_START_PERMILLE);
 
     for (volatile uint32_t i = 0U; i < 50000U; i++) {
     }
     latch_startup_fault_if_needed(adc1_latest_raw());
 
-    hbridge_start_outputs();
+    psfb_start_outputs();
     next_control_tick = g_control_ticks;
 
     while (1) {
-        if (g_hbridge.fault != FAULT_NONE) {
-            fault_led_blink_code(g_hbridge.fault);
+        if (g_psfb.fault != FAULT_NONE) {
+            fault_led_blink_code(g_psfb.fault);
             continue;
         }
 
         if ((int32_t)(g_control_ticks - next_control_tick) >= 0) {
             next_control_tick++;
-            hbridge_control_step(TARGET_VOUT_MV, adc1_latest_raw());
+            psfb_control_step(TARGET_VOUT_MV, adc1_latest_raw());
         }
     }
 }

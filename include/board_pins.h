@@ -2,7 +2,7 @@
 #define BOARD_PINS_H
 
 /*
- * STM32F103C6T6 H-bridge gate-drive pin map.
+ * STM32F103C6T6 PSFB gate-drive pin map.
  *
  * Only TIM1 bridge outputs and PA0 VOUT feedback are used in this version.
  * PA13/PA14 are left untouched for SWD.

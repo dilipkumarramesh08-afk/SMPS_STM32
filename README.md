@@ -1,6 +1,6 @@
-# STM32F103C6T6 H-Bridge PWM Firmware
+# STM32F103C6T6 PSFB Firmware
 
-This firmware is a normal bipolar H-bridge transformer driver. It is not PSFB.
+This firmware is PSFB-only. The old variable-duty H-bridge fallback has been removed.
 
 Target MCU: STM32F103C6T6 at 72 MHz from an 8 MHz external HSE.
 
@@ -27,37 +27,34 @@ ADC clock = PCLK2 / 6 = 12 MHz
 
 Do not run high power until current sensing and hardware shutdown are added.
 
-## Waveform
+## PSFB Waveform
 
-TIM1 generates one center-aligned bipolar switching period in hardware:
+Both bridge legs are fixed 50% duty. Output power is controlled only by right-leg phase shift:
 
 ```text
+Q1 + Q3 ON -> zero state
 Q1 + Q4 ON -> +VIN across transformer primary
-Q2 + Q4 or Q1 + Q3 -> zero/freewheel state
+Q2 + Q4 ON -> zero state
 Q2 + Q3 ON -> -VIN across transformer primary
-Q1 + Q3 or Q2 + Q4 -> zero/freewheel state
 repeat
 ```
 
-Positive and negative pulse widths are always equal. Q1/Q2 and Q3/Q4 are never intentionally enabled together. TIM1 complementary outputs provide same-leg dead time in hardware.
+Positive and negative transfer intervals are always equal. Q1/Q2 and Q3/Q4 are never intentionally enabled together. TIM1 complementary outputs provide same-leg dead time in hardware.
 
-`ENABLE_ALTERNATING_FREEWHEEL` alternates the zero/freewheel state between low-side freewheel `Q2+Q4` and high-side freewheel `Q1+Q3` at TIM1 update boundaries. This keeps transformer volt-seconds balanced while sharing zero-state conduction between devices.
+This is hard-switched PSFB. It does not implement ZVS detection, adaptive dead-time, or current-mode control.
 
 ## Active Defaults
 
 ```c
-#define TARGET_VOUT_MV 28000U
+#define TARGET_VOUT_MV 30000U
 #define FSW_HZ 20000UL
 #define CONTROL_LOOP_HZ 8000UL
-#define NORMAL_DEADTIME_NS 400UL
+#define NORMAL_DEADTIME_NS 1200UL
 #define SOFTSTART_TIME_MS 3000UL
-#define DUTY_MAX_PERMILLE 850U
-#define DUTY_LIMIT_NEAR_TARGET_PERMILLE 800U
-#define DUTY_LIMIT_ABOVE_TARGET_PERMILLE 650U
-#define ENABLE_ALTERNATING_FREEWHEEL 1U
+#define PSFB_PHASE_MAX_PERMILLE 950U
 ```
 
-The duty command is total bipolar active duty. At the 850 permille limit, each transformer polarity pulse can reach about 42.5% of the switching period.
+`PSFB_PHASE_MAX_PERMILLE` allows up to 95% phase shift for this test build. There is still no current sense or hardware fault input, so use current-limited input during bring-up.
 
 ## Feedback
 
@@ -76,37 +73,38 @@ Expected PA0 levels:
 24 V output -> about 2.18 V
 26 V output -> about 2.36 V
 28 V output -> about 2.55 V
+30 V output -> about 2.73 V
 maximum measurable output -> about 36.3 V
 ```
 
 ## Control
 
-The only active operating mode is closed-loop voltage control from PA0.
-
+- closed-loop voltage control from PA0
 - soft-start from 0 V to target over 3 seconds
 - 8 kHz PI control loop from SysTick
-- fractional soft-start ramp accumulator
-- duty slew below 70% target: up 300 permille/sec, down 1000 permille/sec
-- duty slew above 70% target: up 3000 permille/sec, down 8000 permille/sec
-- fractional duty-slew accumulator keeps those rates correct at 8 kHz
-- dynamic duty ceiling: 850 permille during soft-start/low/mid output, 800 above 95% target, 650 at or above target
+- PI output commands `phase_permille`
+- phase slew below 70% target: up 300 permille/sec, down 1000 permille/sec
+- phase slew above 70% target: up 3000 permille/sec, down 8000 permille/sec
+- fractional soft-start and phase-slew accumulators
 - 25 mV voltage deadband
 - PI anti-windup
-- ADC1 continuous sampling
+- ADC1 sampling triggered from internal TIM1_CH3 compare event
+- TIM1_CH3 is not connected to a GPIO; it is used only as the ADC trigger point
 - DMA1_Channel1 circular ADC buffer averaging
+- ADC DMA average rejects the highest and lowest sample from each 16-sample buffer
 - adaptive ADC IIR filter: fast shift 1 when raw delta is 8 counts or more, slow shift 3 when steady
-- TIM1 center-aligned PWM generates bridge timing in hardware
-- TIM1 update interrupt selects the next synchronous freewheel state only
-- SysTick control-loop interrupt runs below TIM1 priority
+- TIM1 output compare toggle mode generates fixed-50% PSFB legs in hardware
+- SysTick control-loop interrupt runs below TIM1 hardware timing
 - soft-start step and OVP limit are cached after target setup
 
-TIM1 PWM usage:
+TIM1 PSFB usage:
 
 ```text
-CH1 PWM1  -> Q1 near counter zero
-CH1N      -> Q2 complementary with dead time
-CH2 PWM2  -> Q3 near counter ARR
-CH2N      -> Q4 complementary with dead time
+CH1 toggle  -> left leg Q1/Q2 fixed 50%
+CH1N        -> left complementary output with dead time
+CH2 toggle  -> right leg Q3/Q4 fixed 50%, delayed by phase
+CH2N        -> right complementary output with dead time
+CH3 compare -> internal ADC trigger in zero/freewheel interval; PA10 is not configured as an output
 ```
 
 PI terms:
@@ -119,14 +117,13 @@ I update = error_mv >> 9
 Useful ST-LINK watch fields:
 
 ```c
-g_hbridge.vout_mv
-g_hbridge.target_ramped_mv
-g_hbridge.error_mv
-g_hbridge.duty_target_permille
-g_hbridge.duty_actual_permille
-g_hbridge.duty_limit_permille
-g_hbridge.freewheel_state
-g_hbridge.fault
+g_psfb.vout_mv
+g_psfb.target_ramped_mv
+g_psfb.error_mv
+g_psfb.phase_target_permille
+g_psfb.phase_actual_permille
+g_psfb.phase_limit_permille
+g_psfb.fault
 ```
 
 ## Protection
@@ -134,7 +131,7 @@ g_hbridge.fault
 Fault behavior:
 
 - clear TIM1_BDTR.MOE
-- set duty to zero
+- set phase shift to zero
 - latch fault
 - require reset
 
@@ -154,7 +151,7 @@ OVP:
 OVP = TARGET_VOUT_MV * 1.5
 ```
 
-For the 28 V target, OVP is 42 V. OVP must be detected on 24 consecutive 8 kHz control-loop readings before shutdown. ADC near-full-scale protection trips above raw ADC 3900.
+For the 30 V target, OVP is 45 V. OVP must be detected on 24 consecutive 8 kHz control-loop readings before shutdown. ADC near-full-scale protection trips above raw ADC 3900 only after 24 consecutive 8 kHz control-loop readings.
 
 Low-feedback protection is blanked for 4000 ms after startup. After blanking, PA0 must remain almost zero for 3000 ms before the feedback-low fault latches.
 

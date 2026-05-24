@@ -11,10 +11,60 @@
 
 static volatile uint32_t g_control_ticks = 0;
 static volatile uint16_t g_adc_dma[ADC_DMA_SAMPLES];
+static volatile uint16_t g_adc_latest_raw = 0;
+static volatile uint8_t g_adc_ready = 0;
 
 void SysTick_Handler(void)
 {
     g_control_ticks++;
+}
+
+static uint16_t adc_average_window(uint32_t start, uint32_t count)
+{
+    uint32_t sum = 0U;
+    uint16_t min_raw = 0xFFFFU;
+    uint16_t max_raw = 0U;
+
+    for (uint32_t i = start; i < (start + count); i++) {
+        uint16_t sample = g_adc_dma[i];
+
+        sum += sample;
+        if (sample < min_raw) {
+            min_raw = sample;
+        }
+        if (sample > max_raw) {
+            max_raw = sample;
+        }
+    }
+
+    if (count > 2U) {
+        sum -= min_raw;
+        sum -= max_raw;
+        count -= 2U;
+    }
+
+    return (uint16_t)((sum + (count / 2U)) / count);
+}
+
+void DMA1_Channel1_IRQHandler(void)
+{
+    uint32_t isr = DMA1->ISR;
+
+    if ((isr & DMA_ISR_TEIF1) != 0U) {
+        DMA1->IFCR = DMA_IFCR_CTEIF1;
+    }
+
+    if ((isr & DMA_ISR_HTIF1) != 0U) {
+        DMA1->IFCR = DMA_IFCR_CHTIF1;
+        g_adc_latest_raw = adc_average_window(0U, ADC_DMA_SAMPLES / 2U);
+        g_adc_ready = 1U;
+    }
+
+    if ((isr & DMA_ISR_TCIF1) != 0U) {
+        DMA1->IFCR = DMA_IFCR_CTCIF1;
+        g_adc_latest_raw = adc_average_window(ADC_DMA_SAMPLES / 2U, ADC_DMA_SAMPLES / 2U);
+        g_adc_ready = 1U;
+    }
 }
 
 static void clock_init_72mhz_hse_pll(void)
@@ -138,8 +188,6 @@ static uint8_t fault_blink_count(fault_t fault)
         return 3U;
     case FAULT_FEEDBACK_LOW_OR_DISCONNECTED:
         return 4U;
-    case FAULT_SOFTWARE_LIMIT:
-        return 5U;
     case FAULT_NONE:
     default:
         return 0U;
@@ -179,7 +227,10 @@ static void adc1_init(void)
                          DMA_CCR_MSIZE_0 |
                          DMA_CCR_PSIZE_0 |
                          DMA_CCR_MINC |
-                         DMA_CCR_CIRC;
+                         DMA_CCR_CIRC |
+                         DMA_CCR_HTIE |
+                         DMA_CCR_TCIE |
+                         DMA_CCR_TEIE;
 
     ADC1->CR1 = 0U;
     ADC1->CR2 = 0U;
@@ -199,17 +250,15 @@ static void adc1_init(void)
     while ((ADC1->CR2 & ADC_CR2_CAL) != 0U) {
     }
 
+    NVIC_SetPriority(DMA1_Channel1_IRQn, IRQ_PRIORITY_DMA);
+    NVIC_EnableIRQ(DMA1_Channel1_IRQn);
+
     DMA1_Channel1->CCR |= DMA_CCR_EN;
-#if ADC_USE_TIM1_TRIGGER
     ADC1->SR = 0U;
     ADC1->CR2 = ADC_CR2_DMA |
                 ADC_CR2_EXTSEL_1 |
                 ADC_CR2_EXTTRIG |
                 ADC_CR2_ADON;
-#else
-    ADC1->CR2 = ADC_CR2_DMA | ADC_CR2_CONT | ADC_CR2_ADON;
-    ADC1->CR2 |= ADC_CR2_ADON;       /* Start continuous conversions. */
-#endif
 
     for (volatile uint32_t i = 0U; i < 10000U; i++) {
     }
@@ -217,29 +266,11 @@ static void adc1_init(void)
 
 static uint16_t adc1_latest_raw(void)
 {
-    uint32_t sum = 0U;
-    uint16_t min_raw = 0xFFFFU;
-    uint16_t max_raw = 0U;
-
-    for (uint32_t i = 0U; i < ADC_DMA_SAMPLES; i++) {
-        uint16_t sample = g_adc_dma[i];
-
-        sum += sample;
-        if (sample < min_raw) {
-            min_raw = sample;
-        }
-        if (sample > max_raw) {
-            max_raw = sample;
-        }
+    if (g_adc_ready == 0U) {
+        return adc_average_window(0U, ADC_DMA_SAMPLES);
     }
 
-#if ADC_DMA_SAMPLES > 2U
-    sum -= min_raw;
-    sum -= max_raw;
-    return (uint16_t)((sum + ((ADC_DMA_SAMPLES - 2U) / 2U)) / (ADC_DMA_SAMPLES - 2U));
-#else
-    return (uint16_t)((sum + (ADC_DMA_SAMPLES / 2U)) / ADC_DMA_SAMPLES);
-#endif
+    return g_adc_latest_raw;
 }
 
 static void latch_startup_fault_if_needed(uint16_t adc_raw)

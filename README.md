@@ -47,14 +47,15 @@ This is hard-switched PSFB. It does not implement ZVS detection, adaptive dead-t
 
 ```c
 #define TARGET_VOUT_MV 30000U
-#define FSW_HZ 20000UL
+#define FSW_HZ 100000UL
 #define CONTROL_LOOP_HZ 8000UL
-#define NORMAL_DEADTIME_NS 1200UL
+#define NORMAL_DEADTIME_NS 100UL
+#define TIM1_DEADTIME_ACTUAL_NS 111UL
 #define SOFTSTART_TIME_MS 3000UL
-#define PSFB_PHASE_MAX_PERMILLE 950U
+#define PSFB_PHASE_MAX_PERMILLE 900U
 ```
 
-`PSFB_PHASE_MAX_PERMILLE` allows up to 95% phase shift for this test build. There is still no current sense or hardware fault input, so use current-limited input during bring-up.
+`PSFB_PHASE_MAX_PERMILLE` allows up to 90% phase shift for this test build. The bridge legs remain fixed at 50% duty in PSFB mode. There is still no current sense or hardware fault input, so use current-limited input during bring-up.
 
 ## Feedback
 
@@ -90,8 +91,8 @@ maximum measurable output -> about 36.3 V
 - PI anti-windup
 - ADC1 sampling triggered from internal TIM1_CH3 compare event
 - TIM1_CH3 is not connected to a GPIO; it is used only as the ADC trigger point
-- DMA1_Channel1 circular ADC buffer averaging
-- ADC DMA average rejects the highest and lowest sample from each 16-sample buffer
+- DMA1_Channel1 circular ADC buffer with half/full-transfer interrupt averaging
+- ADC DMA average rejects the highest and lowest sample from each 8-sample half-buffer
 - adaptive ADC IIR filter: fast shift 1 when raw delta is 8 counts or more, slow shift 3 when steady
 - TIM1 output compare toggle mode generates fixed-50% PSFB legs in hardware
 - SysTick control-loop interrupt runs below TIM1 hardware timing
@@ -142,16 +143,15 @@ Fault blink codes on PC13:
 2 blinks = output over-voltage
 3 blinks = ADC near full scale
 4 blinks = feedback low or disconnected
-5 blinks = software limit
 ```
 
 OVP:
 
 ```text
-OVP = TARGET_VOUT_MV * 1.5
+OVP = min(TARGET_VOUT_MV + 4000 mV, 34000 mV)
 ```
 
-For the 30 V target, OVP is 45 V. OVP must be detected on 24 consecutive 8 kHz control-loop readings before shutdown. ADC near-full-scale protection trips above raw ADC 3900 only after 24 consecutive 8 kHz control-loop readings.
+For the 30 V target, OVP is 34 V. OVP must be detected on 24 consecutive 8 kHz control-loop readings before shutdown. ADC near-full-scale protection trips above raw ADC 3900 only after 24 consecutive 8 kHz control-loop readings.
 
 Low-feedback protection is blanked for 4000 ms after startup. After blanking, PA0 must remain almost zero for 3000 ms before the feedback-low fault latches.
 

@@ -21,12 +21,12 @@
 #define APB2_CLK_HZ                   (SYSCLK_HZ / APB2_PRESCALER)
 #define TIM1_CLK_HZ                   ((APB2_PRESCALER == 1UL) ? APB2_CLK_HZ : (2UL * APB2_CLK_HZ))
 
-#define FSW_HZ                        20000UL
+#define FSW_HZ                        100000UL
 #define CONTROL_LOOP_HZ               8000UL
-#define NORMAL_DEADTIME_NS            1200UL
+#define NORMAL_DEADTIME_NS            100UL
 #define SOFTSTART_TIME_MS             3000UL
 
-#define PSFB_PHASE_MAX_PERMILLE       950U
+#define PSFB_PHASE_MAX_PERMILLE       900U
 #define PSFB_PHASE_START_PERMILLE     0U
 
 #define VOUT_CONTROL_DEADBAND_MV      25U
@@ -41,8 +41,8 @@
 #define PHASE_SLEW_UP_HIGH_PERMILLE_PER_SEC 3000U
 #define PHASE_SLEW_DOWN_HIGH_PERMILLE_PER_SEC 8000U
 
-#define OVP_MULTIPLIER_NUM            3U
-#define OVP_MULTIPLIER_DEN            2U
+#define OVP_MARGIN_MV                 4000U
+#define OVP_MAX_MV                    34000U
 #define OVP_CONFIRM_COUNT             24U
 #define ADC_NEAR_FULL_SCALE_LIMIT     3900U
 #define ADC_NEAR_FULL_CONFIRM_COUNT   24U
@@ -50,12 +50,12 @@
 #define ADC_FILTER_SLOW_SHIFT         3U
 #define ADC_FILTER_FAST_DELTA_RAW     8U
 #define ADC_DMA_SAMPLES               16U
-#define ADC_USE_TIM1_TRIGGER          1
 #define ADC_SMPR2_CH0_55_5_CYCLES     (ADC_SMPR2_SMP0_2 | ADC_SMPR2_SMP0_0)
 
 #define FEEDBACK_PROTECTION_BLANKING_MS 4000U
 #define FEEDBACK_LOW_TIMEOUT_MS       3000U
 
+#define IRQ_PRIORITY_DMA              1U
 #define IRQ_PRIORITY_SYSTICK          2U
 
 /*
@@ -64,6 +64,24 @@
  */
 #define TIM1_HALF_PERIOD_TICKS        (TIM1_CLK_HZ / (2UL * FSW_HZ))
 #define TIM1_ARR_VALUE                (TIM1_HALF_PERIOD_TICKS - 1UL)
+#define TIM1_DEADTIME_RAW_TICKS       (((NORMAL_DEADTIME_NS * (TIM1_CLK_HZ / 1000000UL)) + 999UL) / 1000UL)
+#define TIM1_DEADTIME_ACTUAL_NS       (((TIM1_DEADTIME_RAW_TICKS * 1000UL) + ((TIM1_CLK_HZ / 1000000UL) / 2UL)) / (TIM1_CLK_HZ / 1000000UL))
+
+#if TIM1_HALF_PERIOD_TICKS < 100UL
+#error "FSW_HZ is too high for safe TIM1 PSFB timing resolution"
+#endif
+
+#if (TIM1_DEADTIME_RAW_TICKS == 0UL) || (TIM1_DEADTIME_RAW_TICKS > 1008UL)
+#error "NORMAL_DEADTIME_NS is outside TIM1 BDTR.DTG supported range"
+#endif
+
+#if (PSFB_PHASE_MAX_PERMILLE == 0U) || (PSFB_PHASE_MAX_PERMILLE > 950U)
+#error "PSFB_PHASE_MAX_PERMILLE must be 1..950"
+#endif
+
+#if (ADC_DMA_SAMPLES < 4U) || ((ADC_DMA_SAMPLES % 2U) != 0U)
+#error "ADC_DMA_SAMPLES must be an even value of at least 4"
+#endif
 
 #if (LEFT_GATE_DRIVER_ACTIVE_HIGH != 0) && (LEFT_GATE_DRIVER_ACTIVE_HIGH != 1)
 #error "LEFT_GATE_DRIVER_ACTIVE_HIGH must be 0 or 1"
@@ -78,8 +96,7 @@ typedef enum {
     FAULT_INVALID_TARGET,
     FAULT_OVERVOLTAGE,
     FAULT_ADC_NEAR_FULL_SCALE,
-    FAULT_FEEDBACK_LOW_OR_DISCONNECTED,
-    FAULT_SOFTWARE_LIMIT
+    FAULT_FEEDBACK_LOW_OR_DISCONNECTED
 } fault_t;
 
 typedef struct {
@@ -104,6 +121,5 @@ void psfb_latch_fault(fault_t fault);
 void psfb_set_phase_permille(uint16_t phase_permille);
 uint32_t psfb_adc_raw_to_vout_mv(uint16_t adc_raw);
 uint32_t psfb_ovp_limit_mv(uint32_t target_vout_mv);
-uint8_t psfb_deadtime_dtg(void);
 
 #endif

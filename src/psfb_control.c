@@ -124,15 +124,17 @@ uint32_t psfb_adc_raw_to_vout_mv(uint16_t adc_raw)
 
 uint32_t psfb_ovp_limit_mv(uint32_t target_vout_mv)
 {
-    return (target_vout_mv * OVP_MULTIPLIER_NUM) / OVP_MULTIPLIER_DEN;
+    uint32_t limit_mv = target_vout_mv + OVP_MARGIN_MV;
+
+    return (limit_mv > OVP_MAX_MV) ? OVP_MAX_MV : limit_mv;
 }
 
 static uint32_t deadtime_ticks_raw(void)
 {
-    return ((NORMAL_DEADTIME_NS * (TIM1_CLK_HZ / 1000000UL)) + 999UL) / 1000UL;
+    return TIM1_DEADTIME_RAW_TICKS;
 }
 
-uint8_t psfb_deadtime_dtg(void)
+static uint8_t psfb_deadtime_dtg(void)
 {
     uint32_t ticks = deadtime_ticks_raw();
 

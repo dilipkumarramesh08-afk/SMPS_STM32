@@ -15,24 +15,10 @@ enum {
 static uint16_t s_half_period_ticks = 0;
 static volatile uint8_t s_outputs_allowed = 0;
 static int32_t s_integrator_q8 = 0;
-static uint32_t s_ramp_target_mv_q = 0;
-static uint32_t s_ramp_config_target_mv = 0;
-static uint32_t s_ramp_step_q = 0;
 static uint32_t s_slew_up_accum_q = 0;
 static uint32_t s_slew_down_accum_q = 0;
-static uint32_t s_control_ticks = 0;
-static uint32_t s_control_target_mv = 0;
-static uint32_t s_control_ovp_limit_mv = 0;
-static uint16_t s_feedback_low_ticks = 0;
-static uint8_t s_ovp_confirm_count = 0;
-static uint8_t s_adc_full_confirm_count = 0;
 
 static void psfb_set_phase_raw(uint16_t phase_permille);
-
-static uint32_t ms_to_control_ticks(uint32_t ms)
-{
-    return (ms * CONTROL_LOOP_HZ) / 1000UL;
-}
 
 static uint16_t psfb_phase_limit(void)
 {
@@ -57,11 +43,6 @@ static uint16_t psfb_adc_trigger_tick(uint32_t delayed_toggle_tick)
         delayed_toggle_tick = s_half_period_ticks - 1UL;
     }
 
-    /*
-     * Sample in the middle of the longer quiet interval between switching
-     * edges. This keeps the ADC aperture away from both leg transitions across
-     * low and high phase-shift commands.
-     */
     before_delay_ticks = delayed_toggle_tick - leading_toggle_tick;
     after_delay_ticks = s_half_period_ticks - delayed_toggle_tick;
 
@@ -118,18 +99,12 @@ static inline void psfb_emergency_shutdown(void)
     s_outputs_allowed = 0U;
     tim1_disable_outputs();
     g_psfb.phase_actual_permille = 0U;
-    g_psfb.phase_cmd_permille = 0U;
-    g_psfb.phase_target_permille = 0U;
     g_psfb.phase_limit_permille = psfb_phase_limit();
-    g_psfb.target_ramped_mv = 0U;
-    g_psfb.error_mv = 0;
+    g_psfb.feedback_normalized_raw = 0U;
+    g_psfb.feedback_error_raw = 0;
     s_integrator_q8 = 0;
-    s_ramp_target_mv_q = 0U;
-    s_ramp_config_target_mv = 0U;
-    s_ramp_step_q = 0U;
     s_slew_up_accum_q = 0U;
     s_slew_down_accum_q = 0U;
-    s_control_ticks = 0U;
     psfb_set_phase_raw(0U);
     __DSB();
 }
@@ -160,19 +135,6 @@ static uint32_t tim1_off_state_bits(void)
 #endif
 
     return bits;
-}
-
-uint32_t psfb_adc_raw_to_vout_mv(uint16_t adc_raw)
-{
-    uint32_t adc_mv = ((uint32_t)adc_raw * ADC_REF_MV) / ADC_FULL_SCALE;
-    return (adc_mv * VOUT_DIVIDER_GAIN_NUM) / VOUT_DIVIDER_GAIN_DEN;
-}
-
-uint32_t psfb_ovp_limit_mv(uint32_t target_vout_mv)
-{
-    uint32_t limit_mv = target_vout_mv + OVP_MARGIN_MV;
-
-    return (limit_mv > OVP_MAX_MV) ? OVP_MAX_MV : limit_mv;
 }
 
 static uint32_t deadtime_ticks_raw(void)
@@ -366,70 +328,57 @@ static uint16_t pi_controller(int32_t error_mv, uint16_t max_permille)
     return saturated;
 }
 
-static void update_softstart_target(uint32_t target_vout_mv)
+static uint16_t opto_error_feedforward_phase(int32_t error_raw, uint16_t phase_limit)
 {
-    uint32_t target_q = target_vout_mv << SOFTSTART_RAMP_Q_SHIFT;
+    uint32_t positive_error;
+    uint32_t phase;
 
-    if (s_ramp_config_target_mv != target_vout_mv) {
-        uint32_t ramp_ticks = ms_to_control_ticks(SOFTSTART_TIME_MS);
-
-        if (ramp_ticks == 0UL) {
-            ramp_ticks = 1UL;
-        }
-
-        s_ramp_step_q = target_q / ramp_ticks;
-        if (s_ramp_step_q == 0UL) {
-            s_ramp_step_q = 1UL;
-        }
-        s_ramp_config_target_mv = target_vout_mv;
+    if (error_raw <= 0) {
+        return 0U;
     }
 
-    if ((g_psfb.vout_mv + VOUT_CONTROL_DEADBAND_MV) >= target_vout_mv) {
-        s_ramp_target_mv_q = target_q;
-        g_psfb.target_ramped_mv = target_vout_mv;
-        return;
+    positive_error = (uint32_t)error_raw;
+    if (positive_error >= OPTO_FULL_POWER_ERROR_RAW) {
+        return phase_limit;
     }
 
-    if (s_ramp_target_mv_q >= target_q) {
-        g_psfb.target_ramped_mv = target_vout_mv;
-        return;
+    phase = (positive_error * phase_limit) / OPTO_FULL_POWER_ERROR_RAW;
+    return (uint16_t)((phase > phase_limit) ? phase_limit : phase);
+}
+
+static uint16_t opto_normalized_feedback(uint16_t adc_filtered)
+{
+#if OPTO_OUTPUT_HIGH_PULLS_LOW
+    return (uint16_t)(ADC_FULL_SCALE_RAW - adc_filtered);
+#else
+    return adc_filtered;
+#endif
+}
+
+static uint8_t opto_feedback_near_target(void)
+{
+    int32_t error = g_psfb.feedback_error_raw;
+
+    if (error < 0) {
+        error = -error;
     }
 
-    s_ramp_target_mv_q += s_ramp_step_q;
-    if (s_ramp_target_mv_q > target_q) {
-        s_ramp_target_mv_q = target_q;
-    }
-
-    g_psfb.target_ramped_mv =
-        (s_ramp_target_mv_q + ((1UL << SOFTSTART_RAMP_Q_SHIFT) - 1UL)) >>
-        SOFTSTART_RAMP_Q_SHIFT;
+    return (error <= (int32_t)OPTO_FAST_ERROR_RAW) ? 1U : 0U;
 }
 
 static uint16_t active_slew_up_permille(void)
 {
-    uint32_t fast_threshold_mv =
-        (g_psfb.target_ramped_mv * FAST_CONTROL_THRESHOLD_NUM) /
-        FAST_CONTROL_THRESHOLD_DEN;
-
-    if ((g_psfb.target_ramped_mv > 0U) &&
-        (g_psfb.vout_mv >= fast_threshold_mv)) {
+    if (opto_feedback_near_target() != 0U) {
         return PHASE_SLEW_UP_HIGH_PERMILLE_PER_SEC;
     }
-
     return PHASE_SLEW_UP_LOW_PERMILLE_PER_SEC;
 }
 
 static uint16_t active_slew_down_permille(void)
 {
-    uint32_t fast_threshold_mv =
-        (g_psfb.target_ramped_mv * FAST_CONTROL_THRESHOLD_NUM) /
-        FAST_CONTROL_THRESHOLD_DEN;
-
-    if ((g_psfb.target_ramped_mv > 0U) &&
-        (g_psfb.vout_mv >= fast_threshold_mv)) {
+    if (opto_feedback_near_target() != 0U) {
         return PHASE_SLEW_DOWN_HIGH_PERMILLE_PER_SEC;
     }
-
     return PHASE_SLEW_DOWN_LOW_PERMILLE_PER_SEC;
 }
 
@@ -447,39 +396,19 @@ static uint16_t slew_steps_from_rate(uint16_t permille_per_sec, uint32_t *accum_
     return steps;
 }
 
-static void update_target_cache(uint32_t target_vout_mv)
-{
-    if (s_control_target_mv != target_vout_mv) {
-        s_control_target_mv = target_vout_mv;
-        s_control_ovp_limit_mv = psfb_ovp_limit_mv(target_vout_mv);
-    }
-}
-
-void psfb_control_step(uint32_t target_vout_mv, uint16_t adc_raw)
+void psfb_control_step(uint16_t adc_raw)
 {
     uint16_t phase_cmd;
+    uint16_t phase_ff;
     uint16_t phase_limit;
     uint16_t slew_up;
     uint16_t slew_down;
     int32_t error_mv;
-    uint8_t feedback_blank_active;
 
     if (g_psfb.fault != FAULT_NONE) {
         psfb_emergency_shutdown();
         return;
     }
-
-    if ((target_vout_mv < TARGET_VOUT_MIN_MV) || (target_vout_mv > TARGET_VOUT_MAX_MV)) {
-        psfb_latch_fault(FAULT_INVALID_TARGET);
-        return;
-    }
-    update_target_cache(target_vout_mv);
-
-    if (s_control_ticks < 0xFFFFFFFFUL) {
-        s_control_ticks++;
-    }
-    feedback_blank_active =
-        (s_control_ticks <= ms_to_control_ticks(FEEDBACK_PROTECTION_BLANKING_MS)) ? 1U : 0U;
 
     g_psfb.adc_raw = adc_raw;
     if (g_psfb.adc_filtered == 0U) {
@@ -488,50 +417,25 @@ void psfb_control_step(uint32_t target_vout_mv, uint16_t adc_raw)
         g_psfb.adc_filtered = adc_iir_filter(g_psfb.adc_filtered, adc_raw);
     }
 
-    g_psfb.vout_mv = psfb_adc_raw_to_vout_mv(g_psfb.adc_filtered);
-
-    if (g_psfb.adc_filtered > ADC_NEAR_FULL_SCALE_LIMIT) {
-        if (++s_adc_full_confirm_count >= ADC_NEAR_FULL_CONFIRM_COUNT) {
-            psfb_latch_fault(FAULT_ADC_NEAR_FULL_SCALE);
-            return;
-        }
-    } else {
-        s_adc_full_confirm_count = 0U;
-    }
-
-    if (g_psfb.vout_mv > s_control_ovp_limit_mv) {
-        if (++s_ovp_confirm_count >= OVP_CONFIRM_COUNT) {
-            psfb_latch_fault(FAULT_OVERVOLTAGE);
-            return;
-        }
-    } else {
-        s_ovp_confirm_count = 0U;
-    }
-
-    update_softstart_target(target_vout_mv);
     phase_limit = psfb_phase_limit();
     g_psfb.phase_limit_permille = phase_limit;
+    g_psfb.feedback_normalized_raw = opto_normalized_feedback(g_psfb.adc_filtered);
 
-    error_mv = (int32_t)g_psfb.target_ramped_mv - (int32_t)g_psfb.vout_mv;
-    g_psfb.error_mv = error_mv;
+    error_mv =
+        (int32_t)OPTO_TARGET_FEEDBACK_RAW -
+        (int32_t)g_psfb.feedback_normalized_raw;
+    g_psfb.feedback_error_raw = error_mv;
 
-    if ((error_mv > -(int32_t)VOUT_CONTROL_DEADBAND_MV) &&
-        (error_mv < (int32_t)VOUT_CONTROL_DEADBAND_MV)) {
+    if ((error_mv > -(int32_t)OPTO_CONTROL_DEADBAND_RAW) &&
+        (error_mv < (int32_t)OPTO_CONTROL_DEADBAND_RAW)) {
         phase_cmd = g_psfb.phase_actual_permille;
     } else {
         phase_cmd = pi_controller(error_mv, phase_limit);
     }
 
-    if ((feedback_blank_active == 0U) &&
-        (g_psfb.target_ramped_mv > 5000UL) &&
-        (g_psfb.phase_actual_permille > 10U) &&
-        (g_psfb.adc_filtered < 20U)) {
-        if (++s_feedback_low_ticks > ms_to_control_ticks(FEEDBACK_LOW_TIMEOUT_MS)) {
-            psfb_latch_fault(FAULT_FEEDBACK_LOW_OR_DISCONNECTED);
-            return;
-        }
-    } else {
-        s_feedback_low_ticks = 0U;
+    phase_ff = opto_error_feedforward_phase(error_mv, phase_limit);
+    if (phase_cmd < phase_ff) {
+        phase_cmd = phase_ff;
     }
 
     if (phase_cmd > phase_limit) {
@@ -556,7 +460,5 @@ void psfb_control_step(uint32_t target_vout_mv, uint16_t adc_raw)
         g_psfb.phase_actual_permille = phase_cmd;
     }
 
-    g_psfb.phase_cmd_permille = phase_cmd;
-    g_psfb.phase_target_permille = phase_cmd;
     psfb_set_phase_permille(g_psfb.phase_actual_permille);
 }

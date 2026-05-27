@@ -1,25 +1,12 @@
-/*
- * Change only this value to set output voltage.
- * Allowed range: 12000U to 30000U.
- */
-#define TARGET_VOUT_MV 28000U
-
 #include "psfb_control.h"
 #include "board_pins.h"
 
 #include "stm32f1xx.h"
 
-static volatile uint32_t g_control_ticks = 0;
 static volatile uint16_t g_adc_dma[ADC_DMA_SAMPLES];
-static volatile uint16_t g_adc_latest_raw = 0;
-static volatile uint8_t g_adc_ready = 0;
+static volatile uint16_t g_startup_adc_raw = 0;
 
-void SysTick_Handler(void)
-{
-    g_control_ticks++;
-}
-
-static uint16_t adc_average_window(uint32_t start, uint32_t count)
+static uint16_t adc_opto_window_sample(uint32_t start, uint32_t count)
 {
     uint32_t sum = 0U;
     uint16_t min_raw = 0xFFFFU;
@@ -46,24 +33,18 @@ static uint16_t adc_average_window(uint32_t start, uint32_t count)
     return (uint16_t)((sum + (count / 2U)) / count);
 }
 
-void DMA1_Channel1_IRQHandler(void)
+void TIM1_UP_IRQHandler(void)
 {
-    uint32_t isr = DMA1->ISR;
+    static uint16_t control_divider = 0U;
 
-    if ((isr & DMA_ISR_TEIF1) != 0U) {
-        DMA1->IFCR = DMA_IFCR_CTEIF1;
-    }
+    if ((TIM1->SR & TIM_SR_UIF) != 0U) {
+        TIM1->SR &= (uint16_t)~TIM_SR_UIF;
 
-    if ((isr & DMA_ISR_HTIF1) != 0U) {
-        DMA1->IFCR = DMA_IFCR_CHTIF1;
-        g_adc_latest_raw = adc_average_window(0U, ADC_DMA_HALF_SAMPLES);
-        g_adc_ready = 1U;
-    }
-
-    if ((isr & DMA_ISR_TCIF1) != 0U) {
-        DMA1->IFCR = DMA_IFCR_CTCIF1;
-        g_adc_latest_raw = adc_average_window(ADC_DMA_HALF_SAMPLES, ADC_DMA_HALF_SAMPLES);
-        g_adc_ready = 1U;
+        control_divider++;
+        if (control_divider >= CONTROL_LOOP_FSW_DIVIDER) {
+            control_divider = 0U;
+            psfb_control_step(adc_opto_window_sample(0U, ADC_DMA_SAMPLES));
+        }
     }
 }
 
@@ -168,50 +149,6 @@ static void gpio_init(void)
     gpio_set_analog(PIN_VOUT_FB_PORT, PIN_VOUT_FB_PIN);
 }
 
-static void delay_ms(uint32_t ms)
-{
-    uint32_t start = g_control_ticks;
-    uint32_t ticks = ((ms * CONTROL_LOOP_HZ) + 999UL) / 1000UL;
-
-    while ((uint32_t)(g_control_ticks - start) < ticks) {
-    }
-}
-
-static uint8_t fault_blink_count(fault_t fault)
-{
-    switch (fault) {
-    case FAULT_INVALID_TARGET:
-        return 1U;
-    case FAULT_OVERVOLTAGE:
-        return 2U;
-    case FAULT_ADC_NEAR_FULL_SCALE:
-        return 3U;
-    case FAULT_FEEDBACK_LOW_OR_DISCONNECTED:
-        return 4U;
-    case FAULT_NONE:
-    default:
-        return 0U;
-    }
-}
-
-static void fault_led_blink_code(fault_t fault)
-{
-    uint8_t count = fault_blink_count(fault);
-
-    if (count == 0U) {
-        fault_led_set(0U);
-        return;
-    }
-
-    for (uint8_t i = 0U; i < count; i++) {
-        fault_led_set(1U);
-        delay_ms(150U);
-        fault_led_set(0U);
-        delay_ms(250U);
-    }
-    delay_ms(1000U);
-}
-
 static void adc1_init(void)
 {
     RCC->AHBENR |= RCC_AHBENR_DMA1EN;
@@ -227,10 +164,7 @@ static void adc1_init(void)
                          DMA_CCR_MSIZE_0 |
                          DMA_CCR_PSIZE_0 |
                          DMA_CCR_MINC |
-                         DMA_CCR_CIRC |
-                         DMA_CCR_HTIE |
-                         DMA_CCR_TCIE |
-                         DMA_CCR_TEIE;
+                         DMA_CCR_CIRC;
 
     ADC1->CR1 = 0U;
     ADC1->CR2 = 0U;
@@ -248,75 +182,54 @@ static void adc1_init(void)
     while ((ADC1->CR2 & ADC_CR2_CAL) != 0U) {
     }
 
-    NVIC_SetPriority(DMA1_Channel1_IRQn, IRQ_PRIORITY_DMA);
-    NVIC_EnableIRQ(DMA1_Channel1_IRQn);
-
     DMA1_Channel1->CCR |= DMA_CCR_EN;
     ADC1->SR = 0U;
     ADC1->CR2 = ADC_CR2_DMA |
                 ADC_CR2_EXTSEL_2 |
                 ADC_CR2_EXTTRIG |
                 ADC_CR2_ADON;
+    g_startup_adc_raw = adc_opto_window_sample(0U, ADC_DMA_SAMPLES);
 }
 
-static uint16_t adc1_latest_raw(void)
+static void control_interrupt_init(void)
 {
-    if (g_adc_ready == 0U) {
-        return adc_average_window(0U, ADC_DMA_SAMPLES);
-    }
+    NVIC_SetPriority(TIM1_UP_IRQn, IRQ_PRIORITY_CONTROL);
+    NVIC_EnableIRQ(TIM1_UP_IRQn);
+}
 
-    return g_adc_latest_raw;
+static void control_interrupt_start(void)
+{
+    TIM1->SR &= (uint16_t)~TIM_SR_UIF;
+    TIM1->DIER |= TIM_DIER_UIE;
 }
 
 static void latch_startup_fault_if_needed(uint16_t adc_raw)
 {
-    uint32_t vout_mv;
-
-    if ((TARGET_VOUT_MV < TARGET_VOUT_MIN_MV) ||
-        (TARGET_VOUT_MV > TARGET_VOUT_MAX_MV)) {
-        psfb_latch_fault(FAULT_INVALID_TARGET);
-        return;
-    }
-
-    vout_mv = psfb_adc_raw_to_vout_mv(adc_raw);
     g_psfb.adc_raw = adc_raw;
     g_psfb.adc_filtered = adc_raw;
-    g_psfb.vout_mv = vout_mv;
 
-    if (adc_raw > ADC_NEAR_FULL_SCALE_LIMIT) {
-        psfb_latch_fault(FAULT_ADC_NEAR_FULL_SCALE);
-    } else if (vout_mv > psfb_ovp_limit_mv(TARGET_VOUT_MV)) {
-        psfb_latch_fault(FAULT_OVERVOLTAGE);
+    if ((OPTO_TARGET_FEEDBACK_RAW < 200U) ||
+        (OPTO_TARGET_FEEDBACK_RAW > 3800U)) {
+        psfb_latch_fault(FAULT_INVALID_CONFIG);
     }
 }
 
 int main(void)
 {
-    uint32_t next_control_tick;
-
     clock_init_72mhz_hse_pll();
-    SysTick_Config(SYSCLK_HZ / CONTROL_LOOP_HZ);
-    NVIC_SetPriority(SysTick_IRQn, IRQ_PRIORITY_SYSTICK);
 
     gpio_init();
     adc1_init();
     psfb_init_timer();
+    control_interrupt_init();
     psfb_set_phase_permille(PSFB_PHASE_START_PERMILLE);
 
-    latch_startup_fault_if_needed(adc1_latest_raw());
+    latch_startup_fault_if_needed(g_startup_adc_raw);
 
     psfb_start_outputs();
-    next_control_tick = g_control_ticks;
+    control_interrupt_start();
 
     while (1) {
-        if (g_psfb.fault != FAULT_NONE) {
-            fault_led_blink_code(g_psfb.fault);
-            continue;
-        }
-
-        if ((int32_t)(g_control_ticks - next_control_tick) >= 0) {
-            next_control_tick++;
-            psfb_control_step(TARGET_VOUT_MV, adc1_latest_raw());
-        }
+        fault_led_set(g_psfb.fault != FAULT_NONE);
     }
 }

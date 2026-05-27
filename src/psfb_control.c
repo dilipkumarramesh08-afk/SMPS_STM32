@@ -1,13 +1,15 @@
 #include "psfb_control.h"
+#include "board_pins.h"
 
 #include "stm32f1xx.h"
 
 volatile psfb_status_t g_psfb = {0};
 
 enum {
-    TIM1_CCER_OUTPUT_ENABLES = TIM_CCER_CC1E | TIM_CCER_CC1NE |
-                               TIM_CCER_CC2E | TIM_CCER_CC2NE |
-                               TIM_CCER_CC3E
+    TIM1_CCMR1_TOGGLE_MODES = (3U << TIM_CCMR1_OC1M_Pos) |
+                              (3U << TIM_CCMR1_OC2M_Pos),
+    TIM1_CCMR1_REQUIRED = TIM_CCMR1_OC1PE | TIM_CCMR1_OC2PE |
+                          TIM1_CCMR1_TOGGLE_MODES
 };
 
 static uint16_t s_half_period_ticks = 0;
@@ -25,39 +27,83 @@ static uint16_t s_feedback_low_ticks = 0;
 static uint8_t s_ovp_confirm_count = 0;
 static uint8_t s_adc_full_confirm_count = 0;
 
+static void psfb_set_phase_raw(uint16_t phase_permille);
+
+static uint32_t ms_to_control_ticks(uint32_t ms)
+{
+    return (ms * CONTROL_LOOP_HZ) / 1000UL;
+}
+
 static uint16_t psfb_phase_limit(void)
 {
     return PSFB_PHASE_MAX_PERMILLE;
 }
 
-static uint16_t psfb_adc_trigger_tick(uint32_t right_toggle_tick)
+static uint16_t psfb_adc_trigger_tick(uint32_t delayed_toggle_tick)
 {
+    const uint32_t leading_toggle_tick = 1UL;
     uint32_t trigger_tick;
+    uint32_t before_delay_ticks;
+    uint32_t after_delay_ticks;
+    uint32_t guard_ticks = ADC_TRIGGER_EDGE_GUARD_TICKS;
 
-    if (right_toggle_tick <= 4UL) {
-        return (uint16_t)(s_half_period_ticks / 2UL);
+    if (guard_ticks >= (s_half_period_ticks / 2UL)) {
+        guard_ticks = 4UL;
+    }
+
+    if (delayed_toggle_tick <= leading_toggle_tick) {
+        delayed_toggle_tick = leading_toggle_tick + 1UL;
+    } else if (delayed_toggle_tick >= s_half_period_ticks) {
+        delayed_toggle_tick = s_half_period_ticks - 1UL;
     }
 
     /*
-     * Sample in the long zero/freewheel interval between the left-leg toggle
-     * and the delayed right-leg toggle. At high phase, the interval after the
-     * right-leg toggle is short and can put the ADC aperture on the next edge.
-     * TIM1_CH3 is internal only.
+     * Sample in the middle of the longer quiet interval between switching
+     * edges. This keeps the ADC aperture away from both leg transitions across
+     * low and high phase-shift commands.
      */
-    trigger_tick = right_toggle_tick / 2UL;
+    before_delay_ticks = delayed_toggle_tick - leading_toggle_tick;
+    after_delay_ticks = s_half_period_ticks - delayed_toggle_tick;
 
-    if (trigger_tick < 2UL) {
-        trigger_tick = 2UL;
-    } else if (trigger_tick >= TIM1->ARR) {
-        trigger_tick = TIM1->ARR - 1UL;
+    if (before_delay_ticks >= after_delay_ticks) {
+        trigger_tick = leading_toggle_tick + (before_delay_ticks / 2UL);
+    } else {
+        trigger_tick = delayed_toggle_tick + (after_delay_ticks / 2UL);
+    }
+
+    if (trigger_tick < guard_ticks) {
+        trigger_tick = guard_ticks;
+    } else if (trigger_tick > (s_half_period_ticks - guard_ticks)) {
+        trigger_tick = s_half_period_ticks - guard_ticks;
     }
 
     return (uint16_t)trigger_tick;
 }
 
+static void adc_trigger_timer_configure(uint16_t trigger_tick)
+{
+    RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
+    (void)RCC->APB1ENR;
+
+    TIM3->CR1 = 0U;
+    TIM3->CR2 = TIM_CR2_MMS_0 | TIM_CR2_MMS_1;
+    TIM3->SMCR = TIM_SMCR_SMS_2;
+    TIM3->DIER = 0U;
+    TIM3->PSC = 0U;
+    TIM3->ARR = (uint16_t)((2UL * s_half_period_ticks) - 1UL);
+    TIM3->CCR1 = trigger_tick;
+    TIM3->CCMR1 = TIM_CCMR1_OC1PE;
+    TIM3->CCER = 0U;
+    TIM3->CNT = 0U;
+    TIM3->EGR = TIM_EGR_UG;
+    TIM3->SR = 0U;
+    TIM3->CR1 = TIM_CR1_ARPE | TIM_CR1_CEN;
+}
+
 static void tim1_disable_outputs(void)
 {
     TIM1->BDTR &= ~TIM_BDTR_MOE;
+    TIM3->CR1 &= ~TIM_CR1_CEN;
 }
 
 static void tim1_enable_outputs_if_allowed(void)
@@ -84,7 +130,7 @@ static inline void psfb_emergency_shutdown(void)
     s_slew_up_accum_q = 0U;
     s_slew_down_accum_q = 0U;
     s_control_ticks = 0U;
-    psfb_set_phase_permille(0U);
+    psfb_set_phase_raw(0U);
     __DSB();
 }
 
@@ -160,7 +206,7 @@ static uint8_t psfb_deadtime_dtg(void)
     return 0xFFU;
 }
 
-void psfb_set_phase_permille(uint16_t phase_permille)
+static void psfb_set_phase_raw(uint16_t phase_permille)
 {
     uint32_t phase_ticks;
     uint32_t right_toggle_tick;
@@ -176,13 +222,23 @@ void psfb_set_phase_permille(uint16_t phase_permille)
         right_toggle_tick = TIM1->ARR - 1UL;
     }
 
+#if PSFB_LAGGING_LEG_RIGHT
     TIM1->CCR1 = 1U;
     TIM1->CCR2 = (uint16_t)right_toggle_tick;
-    TIM1->CCR3 = psfb_adc_trigger_tick(right_toggle_tick);
+#else
+    TIM1->CCR1 = (uint16_t)right_toggle_tick;
+    TIM1->CCR2 = 1U;
+#endif
+    TIM3->CCR1 = psfb_adc_trigger_tick(right_toggle_tick);
     TIM1->CCR4 = 0U;
 
     g_psfb.phase_actual_permille = phase_permille;
     g_psfb.phase_limit_permille = phase_limit;
+}
+
+void psfb_set_phase_permille(uint16_t phase_permille)
+{
+    psfb_set_phase_raw(phase_permille);
     tim1_enable_outputs_if_allowed();
 }
 
@@ -200,16 +256,18 @@ void psfb_init_timer(void)
 
     RCC->APB2ENR |= RCC_APB2ENR_TIM1EN;
 
+    s_outputs_allowed = 0U;
     TIM1->BDTR = 0U;
     TIM1->CR1 = 0U;
-    TIM1->CR2 = tim1_off_state_bits();
+    TIM1->CR2 = tim1_off_state_bits() | TIM_CR2_MMS_1;
     TIM1->CCER = 0U;
     TIM1->DIER = 0U;
-    TIM1->RCR = 0U;
+    TIM1->RCR = 1U;
     TIM1->PSC = 0U;
 
     s_half_period_ticks = (uint16_t)(TIM1_ARR_VALUE + 1UL);
     TIM1->ARR = (uint16_t)TIM1_ARR_VALUE;
+    adc_trigger_timer_configure(psfb_adc_trigger_tick(1UL));
 
     /*
      * True PSFB timing:
@@ -217,17 +275,15 @@ void psfb_init_timer(void)
      * - CH2/CH2N right leg toggles after phase_ticks.
      * - At phase = 0 both legs toggle together, so transformer voltage is zero.
      */
-    ccmr1 = TIM_CCMR1_OC1PE |
-            TIM_CCMR1_OC2PE |
-            (3U << TIM_CCMR1_OC1M_Pos) |
-            (3U << TIM_CCMR1_OC2M_Pos);
+    ccmr1 = TIM1_CCMR1_REQUIRED;
     TIM1->CCMR1 = ccmr1;
-    TIM1->CCMR2 = TIM_CCMR2_OC3PE |
-                  (3U << TIM_CCMR2_OC3M_Pos);
-    TIM1->CCER = TIM1_CCER_OUTPUT_ENABLES | tim1_output_polarity_bits();
+    TIM1->CCMR2 = 0U;
+    TIM1->CCER = TIM_CCER_CC1E | TIM_CCER_CC1NE |
+                 TIM_CCER_CC2E | TIM_CCER_CC2NE |
+                 tim1_output_polarity_bits();
     TIM1->BDTR = TIM_BDTR_OSSI | TIM_BDTR_OSSR | psfb_deadtime_dtg();
 
-    psfb_set_phase_permille(PSFB_PHASE_START_PERMILLE);
+    psfb_set_phase_raw(PSFB_PHASE_START_PERMILLE);
 
     TIM1->CNT = 0U;
     TIM1->EGR = TIM_EGR_UG;
@@ -240,13 +296,17 @@ void psfb_start_outputs(void)
 {
     if (g_psfb.fault == FAULT_NONE) {
         s_outputs_allowed = 1U;
+        TIM1->CR1 &= ~TIM_CR1_CEN;
+        TIM3->CR1 &= ~TIM_CR1_CEN;
+        TIM1->CNT = 0U;
+        TIM3->CNT = 0U;
+        TIM1->SR = 0U;
+        TIM3->SR = 0U;
+        TIM3->CR1 |= TIM_CR1_CEN;
+        TIM1->EGR = TIM_EGR_UG;
+        TIM1->CR1 |= TIM_CR1_CEN;
         tim1_enable_outputs_if_allowed();
     }
-}
-
-static uint32_t ms_to_control_ticks(uint32_t ms)
-{
-    return (ms * CONTROL_LOOP_HZ) / 1000UL;
 }
 
 static uint16_t adc_iir_filter(uint16_t previous, uint16_t sample)

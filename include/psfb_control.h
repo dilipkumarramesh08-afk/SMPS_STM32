@@ -11,29 +11,47 @@
 #define TARGET_VOUT_MIN_MV            12000U
 #define TARGET_VOUT_MAX_MV            30000U
 
-#define LEFT_GATE_DRIVER_ACTIVE_HIGH  1
-#define RIGHT_GATE_DRIVER_ACTIVE_HIGH 1
-
 #define SYSCLK_HZ                     72000000UL
 #define HSE_CLK_HZ                    8000000UL
 #define APB1_PRESCALER                2UL
 #define APB2_PRESCALER                1UL
+#define APB1_CLK_HZ                   (SYSCLK_HZ / APB1_PRESCALER)
 #define APB2_CLK_HZ                   (SYSCLK_HZ / APB2_PRESCALER)
+#define TIM_APB1_CLK_HZ               ((APB1_PRESCALER == 1UL) ? APB1_CLK_HZ : (2UL * APB1_CLK_HZ))
 #define TIM1_CLK_HZ                   ((APB2_PRESCALER == 1UL) ? APB2_CLK_HZ : (2UL * APB2_CLK_HZ))
 
-#define FSW_HZ                        100000UL
-#define CONTROL_LOOP_HZ               8000UL
-#define NORMAL_DEADTIME_NS            100UL
+/*
+ * Power-stage timing configuration.
+ *
+ * When changing FSW_HZ or NORMAL_DEADTIME_NS, review every value in this block.
+ * The voltage-control loop is derived from FSW_HZ so the loop bandwidth scales
+ * with switching frequency. Default ratio: FSW_HZ / 25.
+ * TIM1 primary PWM, TIM3 ADC trigger timing, PI/slew response, and oscilloscope
+ * validation are coupled.
+ */
+#define FSW_HZ                        40000UL
+#define CONTROL_LOOP_FSW_DIVIDER      25UL
+#define CONTROL_LOOP_HZ               (FSW_HZ / CONTROL_LOOP_FSW_DIVIDER)
+#define NORMAL_DEADTIME_NS            800UL
 #define SOFTSTART_TIME_MS             3000UL
 
 #define PSFB_PHASE_MAX_PERMILLE       900U
 #define PSFB_PHASE_START_PERMILLE     0U
 
+/*
+ * 0: Q3/Q4 right leg is leading, Q1/Q2 left leg is lagging.
+ * 1: Q1/Q2 left leg is leading, Q3/Q4 right leg is lagging.
+ */
+#define PSFB_LAGGING_LEG_RIGHT        0U
+
+#define LEFT_GATE_DRIVER_ACTIVE_HIGH  1
+#define RIGHT_GATE_DRIVER_ACTIVE_HIGH 1
+
 #define VOUT_CONTROL_DEADBAND_MV      25U
 #define FAST_CONTROL_THRESHOLD_NUM    7U
 #define FAST_CONTROL_THRESHOLD_DEN    10U
-#define PI_KP_SHIFT                   5U
-#define PI_KI_SHIFT                   9U
+#define PI_KP_SHIFT                   4U
+#define PI_KI_SHIFT                   8U
 #define SOFTSTART_RAMP_Q_SHIFT        8U
 #define PHASE_SLEW_Q_SHIFT            8U
 #define PHASE_SLEW_UP_LOW_PERMILLE_PER_SEC 300U
@@ -43,13 +61,17 @@
 
 #define OVP_MARGIN_MV                 4000U
 #define OVP_MAX_MV                    34000U
-#define OVP_CONFIRM_COUNT             24U
+#define OVP_CONFIRM_TIME_US           3000UL
+#define OVP_CONFIRM_COUNT             (((CONTROL_LOOP_HZ * OVP_CONFIRM_TIME_US) + 999999UL) / 1000000UL)
 #define ADC_NEAR_FULL_SCALE_LIMIT     3900U
-#define ADC_NEAR_FULL_CONFIRM_COUNT   24U
+#define ADC_NEAR_FULL_CONFIRM_TIME_US 3000UL
+#define ADC_NEAR_FULL_CONFIRM_COUNT   (((CONTROL_LOOP_HZ * ADC_NEAR_FULL_CONFIRM_TIME_US) + 999999UL) / 1000000UL)
 #define ADC_FILTER_FAST_SHIFT         1U
 #define ADC_FILTER_SLOW_SHIFT         3U
 #define ADC_FILTER_FAST_DELTA_RAW     8U
 #define ADC_DMA_SAMPLES               16U
+#define ADC_DMA_HALF_SAMPLES          (ADC_DMA_SAMPLES / 2U)
+#define ADC_TRIGGER_EDGE_GUARD_TICKS  (TIM1_DEADTIME_RAW_TICKS + 8UL)
 #define ADC_SMPR2_CH0_55_5_CYCLES     (ADC_SMPR2_SMP0_2 | ADC_SMPR2_SMP0_0)
 
 #define FEEDBACK_PROTECTION_BLANKING_MS 4000U
@@ -71,6 +93,14 @@
 #error "FSW_HZ is too high for safe TIM1 PSFB timing resolution"
 #endif
 
+#if (CONTROL_LOOP_FSW_DIVIDER == 0UL) || ((FSW_HZ % CONTROL_LOOP_FSW_DIVIDER) != 0UL)
+#error "CONTROL_LOOP_FSW_DIVIDER must divide FSW_HZ exactly"
+#endif
+
+#if (CONTROL_LOOP_HZ < 1000UL) || (CONTROL_LOOP_HZ > 10000UL)
+#error "CONTROL_LOOP_HZ derived from FSW_HZ is outside the intended 1 kHz..10 kHz range"
+#endif
+
 #if (TIM1_DEADTIME_RAW_TICKS == 0UL) || (TIM1_DEADTIME_RAW_TICKS > 1008UL)
 #error "NORMAL_DEADTIME_NS is outside TIM1 BDTR.DTG supported range"
 #endif
@@ -79,8 +109,20 @@
 #error "PSFB_PHASE_MAX_PERMILLE must be 1..950"
 #endif
 
+#if (PSFB_LAGGING_LEG_RIGHT != 0U) && (PSFB_LAGGING_LEG_RIGHT != 1U)
+#error "PSFB_LAGGING_LEG_RIGHT must be 0 or 1"
+#endif
+
 #if (ADC_DMA_SAMPLES < 4U) || ((ADC_DMA_SAMPLES % 2U) != 0U)
 #error "ADC_DMA_SAMPLES must be an even value of at least 4"
+#endif
+
+#if (ADC_DMA_HALF_SAMPLES < 4U)
+#error "ADC_DMA_HALF_SAMPLES must be at least 4"
+#endif
+
+#if (OVP_CONFIRM_COUNT == 0UL) || (ADC_NEAR_FULL_CONFIRM_COUNT == 0UL)
+#error "Fault confirmation counts must be at least 1 control-loop tick"
 #endif
 
 #if (LEFT_GATE_DRIVER_ACTIVE_HIGH != 0) && (LEFT_GATE_DRIVER_ACTIVE_HIGH != 1)

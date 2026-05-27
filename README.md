@@ -43,16 +43,40 @@ Positive and negative transfer intervals are always equal. Q1/Q2 and Q3/Q4 are n
 
 This is hard-switched PSFB. It does not implement ZVS detection, adaptive dead-time, or current-mode control.
 
+## Secondary Rectifier
+
+The secondary rectifier is diode-only in this build. There is no synchronous-rectifier GPIO, timer, or DMA drive.
+
+## Timing Config Note
+
+Keep all coupled timing values together in [psfb_control.h](</d:/PROJECTS/DC_SMPS_STM32/DC_SMPS_STM32/include/psfb_control.h:24>) under `Power-stage timing configuration`.
+
+When changing switching frequency or dead time, review this whole block:
+
+```c
+#define FSW_HZ
+#define CONTROL_LOOP_FSW_DIVIDER
+#define NORMAL_DEADTIME_NS
+#define PSFB_PHASE_MAX_PERMILLE
+```
+
+`CONTROL_LOOP_HZ` is derived as `FSW_HZ / CONTROL_LOOP_FSW_DIVIDER`. The current ratio is `40 kHz / 25 = 1.6 kHz`. Do not tune the loop frequency separately unless the divider is changed intentionally.
+
+These affect TIM1 primary timing, TIM3 ADC trigger timing, PI/slew response, and oscilloscope validation.
+
 ## Active Defaults
 
 ```c
-#define TARGET_VOUT_MV 30000U
-#define FSW_HZ 100000UL
-#define CONTROL_LOOP_HZ 8000UL
-#define NORMAL_DEADTIME_NS 100UL
-#define TIM1_DEADTIME_ACTUAL_NS 111UL
+#define TARGET_VOUT_MV 28000U
+#define FSW_HZ 40000UL
+#define CONTROL_LOOP_FSW_DIVIDER 25UL
+#define CONTROL_LOOP_HZ 1600UL
+#define NORMAL_DEADTIME_NS 800UL
+#define TIM1_DEADTIME_ACTUAL_NS 806UL
 #define SOFTSTART_TIME_MS 3000UL
 #define PSFB_PHASE_MAX_PERMILLE 900U
+#define PSFB_LAGGING_LEG_RIGHT 0U
+#define ADC_DMA_SAMPLES 16U
 ```
 
 `PSFB_PHASE_MAX_PERMILLE` allows up to 90% phase shift for this test build. The bridge legs remain fixed at 50% duty in PSFB mode. There is still no current sense or hardware fault input, so use current-limited input during bring-up.
@@ -82,19 +106,22 @@ maximum measurable output -> about 36.3 V
 
 - closed-loop voltage control from PA0
 - soft-start from 0 V to target over 3 seconds
-- 8 kHz PI control loop from SysTick
+- 1.6 kHz PI control loop from SysTick, derived from switching frequency
 - PI output commands `phase_permille`
+- PI gains are integer shift based: proportional `error_mv >> 4`, integral accumulator update `error_mv >> 8`
 - phase slew below 70% target: up 300 permille/sec, down 1000 permille/sec
 - phase slew above 70% target: up 3000 permille/sec, down 8000 permille/sec
 - fractional soft-start and phase-slew accumulators
 - 25 mV voltage deadband
 - PI anti-windup
-- ADC1 sampling triggered from internal TIM1_CH3 compare event
-- TIM1_CH3 is not connected to a GPIO; it is used only as the ADC trigger point
+- ADC1 sampling triggered from TIM3_TRGO once per full switching period
+- TIM3 is synchronized by TIM1 full-period TRGO, so ADC sampling remains locked to PSFB timing
 - DMA1_Channel1 circular ADC buffer with half/full-transfer interrupt averaging
 - ADC DMA average rejects the highest and lowest sample from each 8-sample half-buffer
+- ADC trigger is placed in the longer quiet interval between PSFB switching edges and guarded away from edge transitions
 - adaptive ADC IIR filter: fast shift 1 when raw delta is 8 counts or more, slow shift 3 when steady
 - TIM1 output compare toggle mode generates fixed-50% PSFB legs in hardware
+- TIM1 full-period TRGO synchronizes TIM3 through ITR0
 - SysTick control-loop interrupt runs below TIM1 hardware timing
 - soft-start step and OVP limit are cached after target setup
 
@@ -103,9 +130,9 @@ TIM1 PSFB usage:
 ```text
 CH1 toggle  -> left leg Q1/Q2 fixed 50%
 CH1N        -> left complementary output with dead time
-CH2 toggle  -> right leg Q3/Q4 fixed 50%, delayed by phase
+CH2 toggle  -> right leg Q3/Q4 fixed 50%
 CH2N        -> right complementary output with dead time
-CH3 compare -> internal ADC trigger in zero/freewheel interval; PA10 is not configured as an output
+TIM3_TRGO   -> ADC trigger in zero/freewheel interval; TIM3 is internal only
 ```
 
 PI terms:
@@ -151,7 +178,7 @@ OVP:
 OVP = min(TARGET_VOUT_MV + 4000 mV, 34000 mV)
 ```
 
-For the 30 V target, OVP is 34 V. OVP must be detected on 24 consecutive 8 kHz control-loop readings before shutdown. ADC near-full-scale protection trips above raw ADC 3900 only after 24 consecutive 8 kHz control-loop readings.
+For the 28 V target, OVP is 32 V. OVP and ADC near-full-scale protection use about 3 ms of consecutive fault confirmation, derived from the current control-loop rate.
 
 Low-feedback protection is blanked for 4000 ms after startup. After blanking, PA0 must remain almost zero for 3000 ms before the feedback-low fault latches.
 

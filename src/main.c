@@ -2,7 +2,7 @@
  * Change only this value to set output voltage.
  * Allowed range: 12000U to 30000U.
  */
-#define TARGET_VOUT_MV 30000U
+#define TARGET_VOUT_MV 28000U
 
 #include "psfb_control.h"
 #include "board_pins.h"
@@ -56,13 +56,13 @@ void DMA1_Channel1_IRQHandler(void)
 
     if ((isr & DMA_ISR_HTIF1) != 0U) {
         DMA1->IFCR = DMA_IFCR_CHTIF1;
-        g_adc_latest_raw = adc_average_window(0U, ADC_DMA_SAMPLES / 2U);
+        g_adc_latest_raw = adc_average_window(0U, ADC_DMA_HALF_SAMPLES);
         g_adc_ready = 1U;
     }
 
     if ((isr & DMA_ISR_TCIF1) != 0U) {
         DMA1->IFCR = DMA_IFCR_CTCIF1;
-        g_adc_latest_raw = adc_average_window(ADC_DMA_SAMPLES / 2U, ADC_DMA_SAMPLES / 2U);
+        g_adc_latest_raw = adc_average_window(ADC_DMA_HALF_SAMPLES, ADC_DMA_HALF_SAMPLES);
         g_adc_ready = 1U;
     }
 }
@@ -239,8 +239,6 @@ static void adc1_init(void)
     ADC1->SMPR2 = ADC_SMPR2_CH0_55_5_CYCLES;
 
     ADC1->CR2 = ADC_CR2_ADON;
-    for (volatile uint32_t i = 0U; i < 10000U; i++) {
-    }
 
     ADC1->CR2 |= ADC_CR2_RSTCAL;
     while ((ADC1->CR2 & ADC_CR2_RSTCAL) != 0U) {
@@ -256,12 +254,9 @@ static void adc1_init(void)
     DMA1_Channel1->CCR |= DMA_CCR_EN;
     ADC1->SR = 0U;
     ADC1->CR2 = ADC_CR2_DMA |
-                ADC_CR2_EXTSEL_1 |
+                ADC_CR2_EXTSEL_2 |
                 ADC_CR2_EXTTRIG |
                 ADC_CR2_ADON;
-
-    for (volatile uint32_t i = 0U; i < 10000U; i++) {
-    }
 }
 
 static uint16_t adc1_latest_raw(void)
@@ -308,8 +303,6 @@ int main(void)
     psfb_init_timer();
     psfb_set_phase_permille(PSFB_PHASE_START_PERMILLE);
 
-    for (volatile uint32_t i = 0U; i < 50000U; i++) {
-    }
     latch_startup_fault_if_needed(adc1_latest_raw());
 
     psfb_start_outputs();
